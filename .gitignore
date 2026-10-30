@@ -1,0 +1,56 @@
+# Local databases (SQLite and its WAL/journal files) - contain stored memories
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials*.json
+
+# Local server configs that may hold API keys (keep *.example.json)
+/niromem.json
+/config.local.json
+*.local.json
+
+# Claude Code local state and built hooks
+.claude/settings.local.json
+.claude/hooks/
+.claude/projects/
+
+# Build output and binaries
+/bin/
+/dist/
+/niromem
+/niromem-mcp
+/niromem-claude-code
+*.exe
+*.test
+*.out
+coverage.*
+
+# Logs and temp
+*.log
+tmp/
+.scratch/
+
+# Go workspace sums are tracked; local overrides are not
+go.work.local
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "skip": [
+    "(?i)^\\s*(ok|okay|k|thanks|thank you|thx|obrigad[oa]|valeu|lol|haha|hmm+|yes|no|sim|não)\\W*$"
+  ],
+  "flags": [
+    {"name": "instruction-like", "pattern": "(?i)(ignore|disregard|forget) (all |any |the )?(previous|prior|above) (instructions|messages|rules)"},
+    {"name": "instruction-like", "pattern": "(?i)\\b(system prompt|you are now|act as (an?|the) )"},
+    {"name": "control-tokens", "pattern": "<\\|[a-z_]+\\|>|\\[/?INST\\]"}
+  ],
+  "entities": [
+    {"type": "email", "pattern": "[\\w.+-]+@[\\w-]+(\\.[\\w-]+)+"},
+    {"type": "url", "pattern": "https?://[^\\s<>\"']+"},
+    {"type": "order", "pattern": "\\bORD-\\d{4,10}\\b"},
+    {"type": "name", "pattern": "\\b(?P<name>\\p{Lu}\\p{Ll}+(?: \\p{Lu}\\p{Ll}+)+)\\b"}
+  ],
+  "time": [
+    {"pattern": "(?i)\\b(yesterday|ontem)\\b", "offset": "-24h"},
+    {"pattern": "(?i)\\b(last week|semana passada)\\b", "offset": "-168h"},
+    {"pattern": "\\b(?P<year>\\d{4})-(?P<month>\\d{2})-(?P<day>\\d{2})\\b"},
+    {"pattern": "\\b(?P<day>\\d{1,2})/(?P<month>\\d{1,2})/(?P<year>\\d{4})\\b"}
+  ],
+  "facts": [
+    {
+      "id": "user-name",
+      "pattern": "(?i)\\b(?:my name is|call me|me chamo|meu nome é)\\s+(?P<name>\\p{L}+(?: \\p{Lu}\\p{L}+)?)",
+      "emit": {"slot": "user.name", "subject": "{user}", "predicate": "name", "object": "{name}",
+               "text": "User's name is {name}", "entities": [{"type": "person", "from": "{name}"}], "confidence": 0.95},
+      "examples": [
+        {"in": "Hi, my name is Alice Smith.", "want": {"name": "Alice Smith"}},
+        {"in": "me chamo João", "want": {"name": "João"}},
+        {"in": "what is my name?", "want": null}
+      ]
+    },
+    {
+      "id": "user-location",
+      "pattern": "\\b(?:[Ii] live in|[Ii] moved to|I'm living in|[Ee]u moro em|[Mm]e mudei para)\\s+(?P<place>\\p{Lu}\\p{L}+(?:[ -](?:d[aeo]s? |de la )?\\p{Lu}\\p{L}+)*)",
+      "emit": {"slot": "user.location", "subject": "{user}", "predicate": "lives_in", "object": "{place}",
+               "text": "User lives in {place}", "entities": [{"type": "place", "from": "{place}"}], "tags": ["profile"], "confidence": 0.9},
+      "examples": [
+        {"in": "I live in Lisbon now.", "want": {"place": "Lisbon"}},
+        {"in": "I moved to Rio de Janeiro last week", "want": {"place": "Rio de Janeiro"}},
+        {"in": "Eu moro em São Paulo", "want": {"place": "São Paulo"}},
+        {"in": "do you live in Lisbon?", "want": null}
+      ]
+    },
+    {
+      "id": "user-location-ended",
+      "pattern": "\\bI (?:no longer|don't|do not) live in (?P<place>\\p{Lu}\\p{L}+(?:[ -]\\p{Lu}\\p{L}+)*)",
+      "emit": {"op": "invalidate", "slot": "user.location", "match": "{place}"},
+      "examples": [{"in": "I no longer live in Paris.", "want": {"place": "Paris"}}]
+    },
+    {
+      "id": "user-employer",
+      "pattern": "(?i)\\bI (?:work at|work for|joined)\\s+(?P<org>\\p{Lu}[\\p{L}0-9&.' -]{1,40}?)(?:\\s+as\\b|[.,!?]|$)",
+      "emit": {"slot": "user.employer", "subject": "{user}", "predicate": "works_at", "object": "{org}",
+               "text": "User works at {org}", "entities": [{"type": "org", "from": "{org}"}], "tags": ["profile"]},
+      "examples": [{"in": "I work at Acme Corp as an engineer.", "want": {"org": "Acme Corp"}}]
+    },
+    {
+      "id": "user-preference",
+      "pattern": "(?i)\\bI (?P<verb>love|like|prefer|enjoy|hate|dislike|can't stand)\\s+(?P<thing>[^.,!?]{2,60})",
+      "emit": {"kind": "semantic", "subject": "{user}", "predicate": "{verb}", "object": "{thing}",
+               "text": "User {verb}s {thing}", "tags": ["preference"], "confidence": 0.75},
+      "examples": [{"in": "Do you like spicy ramen?", "want": null}, {"in": "I love spicy ramen, honestly", "want": {"thing": "spicy ramen"}}]
+    },
+    {
+      "id": "user-allergy",
+      "pattern": "(?i)\\b(?:I'm|I am) allergic to (?P<thing>[^.,!?]{2,40})",
+      "emit": {"slot": "user.allergy.{thing}", "subject": "{user}", "predicate": "allergic_to", "object": "{thing}",
+               "text": "User is allergic to {thing}", "tags": ["health"], "importance": 0.9, "confidence": 0.95},
+      "examples": [{"in": "I'm allergic to peanuts.", "want": {"thing": "peanuts"}}]
+    },
+    {
+      "id": "explicit-remember",
+      "roles": ["user"],
+      "pattern": "(?i)^\\s*(?:please\\s+)?(?:remember|note|lembre(?:-se)?)\\s+(?:that\\s+|que\\s+)?(?P<fact>.{3,300})$",
+      "emit": {"text": "{fact}", "tags": ["explicit"], "importance": 0.8, "confidence": 0.9},
+      "examples": [{"in": "Remember that the wifi password is on the fridge", "want": {"fact": "the wifi password is on the fridge"}}]
+    }
+  ],
+  "structured": [
+    {
+      "id": "order-status",
+      "source": "get_order",
+      "vars": {"id": "order.id", "status": "order.status"},
+      "require": ["id", "status"],
+      "emit": {"slot": "order.{id}.status", "subject": "{id}", "predicate": "status", "object": "{status}",
+               "text": "Order {id} status is {status}", "entities": [{"type": "order", "from": "{id}"}], "tags": ["order"]},
+      "examples": [{"data": {"order": {"id": "ORD-1234", "status": "shipped"}}, "text": "Order ORD-1234 status is shipped"}]
+    }
+  ]
+}

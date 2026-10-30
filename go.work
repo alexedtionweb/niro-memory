@@ -1,0 +1,14 @@
+go 1.23.0
+
+use (
+	.
+	./cmd/niromem
+	./connectors/niro
+	./connectors/openai
+	./connectors/otel
+	./connectors/postgres
+	./connectors/qdrant
+	./connectors/redis
+	./connectors/s3
+	./connectors/sqlite
+)
