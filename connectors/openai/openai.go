@@ -163,6 +163,9 @@ func (e *Embedder) call(ctx context.Context, texts []string) ([][]float32, int, 
 			if d.Index < 0 || d.Index >= len(out) || len(d.Embedding) != e.o.Dims {
 				return nil, 0, fmt.Errorf("%w: openai returned index %d with %d dims, want %d", vector.ErrDims, d.Index, len(d.Embedding), e.o.Dims)
 			}
+			if out[d.Index] != nil {
+				return nil, 0, fmt.Errorf("openai: duplicate embedding index %d", d.Index)
+			}
 			out[d.Index] = d.Embedding
 		}
 		return out, res.Usage.PromptTokens, nil

@@ -29,6 +29,10 @@ func TestConfig(t *testing.T) {
 	if err != nil || cfg.Store.Use != "postgres" || string(cfg.Store.Options["postgres"]) != `{"dsn":"postgres://x"}` {
 		t.Fatalf("%+v %v", cfg, err)
 	}
+	if cfg.Knowledge.Mode != "disabled" || cfg.Knowledge.Planner.Use != "deterministic" ||
+		cfg.Knowledge.MaxCandidates != 50 || cfg.Knowledge.MaxGraphHops != 3 || cfg.Knowledge.TimeoutMS != 2000 {
+		t.Fatalf("knowledge defaults: %+v", cfg.Knowledge)
+	}
 	if _, err := loadConfig(write(`{"env":"production","auth":{"dev":true}}`)); err == nil {
 		t.Fatal("dev auth allowed in production")
 	}
@@ -37,6 +41,37 @@ func TestConfig(t *testing.T) {
 	}
 	if _, err := loadConfig(write(`{"env":"development","auth":{"dev":true},"typo":1}`)); err == nil {
 		t.Fatal("unknown keys must fail")
+	}
+	for _, invalid := range []string{
+		`{"auth":{"dev":true},"knowledge":{"mode":"automatic"}}`,
+		`{"auth":{"dev":true},"knowledge":{"max_candidates":1001}}`,
+		`{"auth":{"dev":true},"knowledge":{"max_graph_hops":9}}`,
+		`{"auth":{"dev":true},"knowledge":{"timeout_ms":30001}}`,
+		`{"auth":{"dev":true},"knowledge":{"planner":{"use":"unknown"}}}`,
+		`{"auth":{"dev":true},"knowledge":{"admission":{"enabled":true,"max_text_bytes":-1}}}`,
+		`{"auth":{"dev":true},"knowledge":{"admission":{"enabled":true,"max_text_bytes":1048577}}}`,
+	} {
+		if _, err := loadConfig(write(invalid)); err == nil {
+			t.Fatalf("invalid knowledge config accepted: %s", invalid)
+		}
+	}
+	cfg, err = loadConfig(write(`{"auth":{"dev":true},"knowledge":{"mode":"shadow","planner":{"use":"deterministic"},"max_candidates":17,"max_graph_hops":4,"timeout_ms":500,"admission":{"enabled":true,"max_text_bytes":1048576}}}`))
+	if err != nil || cfg.Knowledge.Mode != "shadow" || cfg.Knowledge.MaxCandidates != 17 ||
+		cfg.Knowledge.MaxGraphHops != 4 || cfg.Knowledge.TimeoutMS != 500 {
+		t.Fatalf("valid knowledge config: %+v %v", cfg, err)
+	}
+	if !cfg.Knowledge.Admission.Enabled || cfg.Knowledge.Admission.MaxTextBytes != 1<<20 {
+		t.Fatalf("admission config: %+v", cfg.Knowledge.Admission)
+	}
+}
+
+func TestKnowledgeConfigExample(t *testing.T) {
+	cfg, err := loadConfig("../../configs/knowledge.example.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Knowledge.Mode != "disabled" || cfg.Knowledge.Planner.Use != "deterministic" {
+		t.Fatalf("example must be disabled and deterministic: %+v", cfg.Knowledge)
 	}
 }
 

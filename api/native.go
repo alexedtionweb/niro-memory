@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -14,6 +15,29 @@ import (
 
 func (s *Server) native(mux *http.ServeMux) {
 	e := s.Engine
+	s.knowledge(mux)
+	s.route(mux, "GET /v1/explore", func(w http.ResponseWriter, r *http.Request) error {
+		id := identity(r)
+		u, a, err := scope(id, r.URL.Query().Get("user_id"), r.URL.Query().Get("agent_id"))
+		if err != nil {
+			return err
+		}
+		result, err := e.Explore(r.Context(), niromem.ListRequest{Tenant: id.Tenant, As: principal(id, u, a), User: u, Agent: a,
+			AllVersions: qBool(r, "all_versions"), Limit: qInt(r, "limit", 100), Offset: qInt(r, "offset", 0)})
+		if err != nil {
+			return err
+		}
+		return writeJSON(w, 200, result)
+	})
+	s.route(mux, "POST /v1/relationships/backfill", func(w http.ResponseWriter, r *http.Request) error {
+		if !isAdmin(r) {
+			return fmt.Errorf("%w: relationship backfill requires an admin key", errForbidden)
+		}
+		if err := e.BackfillRelationships(r.Context(), identity(r).Tenant); err != nil {
+			return err
+		}
+		return writeJSON(w, 202, map[string]string{"status": "queued"})
+	})
 	s.route(mux, "GET /v1/capabilities", func(w http.ResponseWriter, r *http.Request) error {
 		return writeJSON(w, 200, e.Capabilities())
 	})
@@ -31,6 +55,12 @@ func (s *Server) native(mux *http.ServeMux) {
 		id := identity(r)
 		for i := range body.Facts {
 			f := &body.Facts[i]
+			if key := r.Header.Get("Idempotency-Key"); key != "" {
+				if f.OperationKey != "" && f.OperationKey != key {
+					return fmt.Errorf("%w: conflicting operation keys", memory.ErrInvalid)
+				}
+				f.OperationKey = key
+			}
 			u, a, err := scope(id, f.User, f.Agent)
 			if err != nil {
 				return err
@@ -90,6 +120,12 @@ func (s *Server) native(mux *http.ServeMux) {
 		if err := decode(r, &p); err != nil {
 			return err
 		}
+		if key := r.Header.Get("Idempotency-Key"); key != "" {
+			if p.OperationKey != "" && p.OperationKey != key {
+				return fmt.Errorf("%w: conflicting operation keys", memory.ErrInvalid)
+			}
+			p.OperationKey = key
+		}
 		id := identity(r)
 		p.Actor = firstNonEmpty(p.Actor, id.Principal.Agent, id.Principal.User, "api")
 		m, err := e.Update(r.Context(), id.Tenant, r.PathValue("id"), p)
@@ -113,7 +149,7 @@ func (s *Server) native(mux *http.ServeMux) {
 			}
 		}
 		id := identity(r)
-		if err := e.Invalidate(r.Context(), id.Tenant, r.PathValue("id"), body.At, firstNonEmpty(id.Principal.Agent, id.Principal.User, "api"), body.Reason); err != nil {
+		if err := e.InvalidateWithKey(r.Context(), id.Tenant, r.PathValue("id"), r.Header.Get("Idempotency-Key"), body.At, firstNonEmpty(id.Principal.Agent, id.Principal.User, "api"), body.Reason); err != nil {
 			return err
 		}
 		return writeJSON(w, 200, map[string]string{"status": "invalidated"})
@@ -121,10 +157,22 @@ func (s *Server) native(mux *http.ServeMux) {
 
 	s.route(mux, "DELETE /v1/memories/{id}", func(w http.ResponseWriter, r *http.Request) error {
 		if _, err := s.readable(r, r.PathValue("id")); err != nil {
-			return err
+			key := r.Header.Get("Idempotency-Key")
+			operations, ok := e.Store().(store.Operations)
+			if !errors.Is(err, memory.ErrNotFound) || key == "" || !ok {
+				return err
+			}
+			// A successful deletion removes its ACL record. Only an existing
+			// receipt permits retry; DeleteWithKey still verifies the input hash.
+			if _, receiptErr := operations.Operation(r.Context(), identity(r).Tenant, "delete:"+key); receiptErr != nil {
+				if errors.Is(receiptErr, memory.ErrNotFound) {
+					return err
+				}
+				return receiptErr
+			}
 		}
 		id := identity(r)
-		if err := e.Delete(r.Context(), id.Tenant, firstNonEmpty(id.Principal.Agent, id.Principal.User, "api"), r.PathValue("id")); err != nil {
+		if err := e.DeleteWithKey(r.Context(), id.Tenant, firstNonEmpty(id.Principal.Agent, id.Principal.User, "api"), r.Header.Get("Idempotency-Key"), r.PathValue("id")); err != nil {
 			return err
 		}
 		return writeJSON(w, 200, map[string]string{"status": "deleted"})

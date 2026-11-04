@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/alexedtionweb/niro-memory/knowledge"
 	"github.com/alexedtionweb/niro-memory/memory"
 	"github.com/alexedtionweb/niro-memory/rules"
 	"github.com/alexedtionweb/niro-memory/search"
@@ -27,6 +28,130 @@ type Settings struct {
 	Policies map[string]search.Policy `json:"policies,omitempty"`
 	// DefaultPolicy is used when a request names none (default "default").
 	DefaultPolicy string `json:"default_policy,omitempty"`
+	// Knowledge narrows server bounds. Mode/provider changes beyond startup
+	// permissions require explicitly registered KnowledgePlanners.
+	Knowledge *KnowledgePolicy `json:"knowledge,omitempty"`
+}
+
+type KnowledgePolicy struct {
+	Mode string `json:"mode,omitempty"`
+	// Planner selects a server-registered runtime profile. Without runtime
+	// profiles, Mode can only narrow the startup permissions.
+	Planner       string `json:"planner,omitempty"`
+	MaxCandidates int    `json:"max_candidates,omitempty"`
+	MaxGraphHops  int    `json:"max_graph_hops,omitempty"`
+}
+
+func (e *Engine) knowledgeOptions(ctx context.Context, tenant string) (KnowledgeOptions, error) {
+	o := e.o.Knowledge
+	s, err := e.Settings(ctx, tenant)
+	if err != nil {
+		return o, err
+	}
+	if p := s.Knowledge; p != nil {
+		if err := e.validateKnowledgePolicy(p); err != nil {
+			return o, err
+		}
+		if p.Planner != "" {
+			o.Planner = e.o.KnowledgePlanners[p.Planner]
+		}
+		if p.Mode != "" {
+			o.Mode = p.Mode
+		}
+		if p.MaxCandidates > 0 && p.MaxCandidates < o.MaxCandidates {
+			o.MaxCandidates = p.MaxCandidates
+		}
+		if p.MaxGraphHops > 0 && p.MaxGraphHops < o.MaxGraphHops {
+			o.MaxGraphHops = p.MaxGraphHops
+		}
+	}
+	return o, nil
+}
+
+func (e *Engine) validateKnowledgePolicy(p *KnowledgePolicy) error {
+	if p == nil {
+		return nil
+	}
+	o := e.o.Knowledge
+	if p.Mode != "" && (knowledgeModeRank(p.Mode) < 0 ||
+		len(e.o.KnowledgePlanners) == 0 && knowledgeModeRank(p.Mode) > knowledgeModeRank(o.Mode)) ||
+		p.MaxCandidates < 0 || p.MaxCandidates > o.MaxCandidates ||
+		p.MaxGraphHops < 0 || p.MaxGraphHops > o.MaxGraphHops {
+		return fmt.Errorf("%w: tenant knowledge policy exceeds server permissions or bounds", memory.ErrInvalid)
+	}
+	if p.Planner != "" && e.o.KnowledgePlanners[p.Planner] == nil {
+		return fmt.Errorf("%w: unknown or unavailable knowledge planner profile %q", memory.ErrInvalid, p.Planner)
+	}
+	return nil
+}
+
+// KnowledgeConfiguration exposes no credentials or provider endpoints.
+type KnowledgeConfiguration struct {
+	Mode                 string `json:"mode"`
+	Provider             string `json:"provider"`
+	Model                string `json:"model,omitempty"`
+	MaxCandidates        int    `json:"max_candidates"`
+	MaxGraphHops         int    `json:"max_graph_hops"`
+	TimeoutMS            int64  `json:"timeout_ms"`
+	Fallback             bool   `json:"fallback"`
+	Consolidation        bool   `json:"consolidation"`
+	Admission            bool   `json:"admission"`
+	BackgroundEnrichment bool   `json:"background_enrichment"`
+}
+
+type KnowledgeConfigurationReport struct {
+	Server    KnowledgeConfiguration            `json:"server"`
+	Effective KnowledgeConfiguration            `json:"effective"`
+	Policy    *KnowledgePolicy                  `json:"policy"`
+	Runtime   bool                              `json:"runtime"`
+	Profiles  map[string]KnowledgeConfiguration `json:"profiles"`
+}
+
+func describeKnowledge(o KnowledgeOptions) KnowledgeConfiguration {
+	provider, model := fmt.Sprintf("%T", o.Planner), ""
+	if o.Planner == nil {
+		provider = "deterministic"
+	} else if _, ok := o.Planner.(knowledge.Deterministic); ok {
+		provider = "deterministic"
+	} else if d, ok := o.Planner.(interface{ KnowledgeProvider() (string, string) }); ok {
+		provider, model = d.KnowledgeProvider()
+	}
+	return KnowledgeConfiguration{o.Mode, provider, model, o.MaxCandidates, o.MaxGraphHops,
+		o.Timeout.Milliseconds(), o.Fallback, o.Consolidation, o.Admission != nil, o.BackgroundEnrichment}
+}
+
+// KnowledgeConfiguration returns effective tenant permissions and registered
+// runtime profiles. Runtime choices remain durable settings, not node state.
+func (e *Engine) KnowledgeConfiguration(ctx context.Context, tenant string) (KnowledgeConfigurationReport, error) {
+	effective, err := e.knowledgeOptions(ctx, tenant)
+	if err != nil {
+		return KnowledgeConfigurationReport{}, err
+	}
+	settings, err := e.Settings(ctx, tenant)
+	if err != nil {
+		return KnowledgeConfigurationReport{}, err
+	}
+	profiles := map[string]KnowledgeConfiguration{}
+	for name, planner := range e.o.KnowledgePlanners {
+		o := e.o.Knowledge
+		o.Planner = planner
+		profiles[name] = describeKnowledge(o)
+	}
+	return KnowledgeConfigurationReport{describeKnowledge(e.o.Knowledge), describeKnowledge(effective), settings.Knowledge,
+		len(profiles) != 0, profiles}, nil
+}
+
+func knowledgeModeRank(mode string) int {
+	switch mode {
+	case "disabled":
+		return 0
+	case "shadow":
+		return 1
+	case "enforced":
+		return 2
+	default:
+		return -1
+	}
 }
 
 // Binding limits what one agent may read, on top of memory visibility.
@@ -86,10 +211,16 @@ func (e *Engine) PutSettings(ctx context.Context, tenant string, s Settings) err
 		return fmt.Errorf("%w: at most one active vector model", memory.ErrInvalid)
 	}
 	for name, p := range s.Policies {
+		if p.RelationshipHops < 0 || p.RelationshipHops > 4 {
+			return fmt.Errorf("%w: relationship_hops must be 0..4", memory.ErrInvalid)
+		}
 		if p.Name == "" {
 			p.Name = name
 			s.Policies[name] = p
 		}
+	}
+	if err := e.validateKnowledgePolicy(s.Knowledge); err != nil {
+		return err
 	}
 	raw, err := json.Marshal(s)
 	if err != nil {

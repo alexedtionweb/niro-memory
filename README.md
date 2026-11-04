@@ -30,13 +30,17 @@ niromem gives an agent durable, searchable, versioned memory without putting an 
 | Bi-temporal | Each fact has a validity window (`ValidFrom`/`ValidTo`) and an invalidation time for corrections. |
 | Conversation history | Turns and multimodal parts stored per run, with summaries and a sliding window. |
 | Durable background work | Extraction, embedding and backfill run through a leased job queue. |
+| Optional knowledge intelligence | Structured assertions, validated transitions, typed relationships, durable idempotency and dependency review. Disabled by default. |
 | Multi-tenant | Tenant is a hard isolation boundary enforced on every query. |
 | Pluggable backends | SQLite, PostgreSQL (pgvector), Qdrant, Redis, S3, or your own. |
 | Several front doors | Go library, native HTTP API, Mem0-compatible API, MCP server, Claude Code hooks. |
 
 Use it when an agent needs to remember facts across sessions (preferences, decisions, conventions, profile data), and you want the recall to be fast, auditable and correctable.
 
-It is not a general document search engine, and it does not interpret user input for you. Interpreting what a user means is the LLM's job (see [section 9](#9-project-conventions)).
+It is not a general document search engine. Semantic interpretation is optional:
+configure your own planner rather than putting an LLM on the retrieval path.
+See [knowledge intelligence](docs/knowledge-intelligence.md) for atomic transitions,
+historical queries, providers, HTTP/MCP inspection and configuration.
 
 ---
 
@@ -62,6 +66,46 @@ Without `-config`, the CLI uses a durable `./niromem.db`, development authentica
 
 `-mcp-user` is the project identity and is required (or set `NIROMEM_USER_ID`). The agent defaults to `claude-code` (`-mcp-agent` / `NIROMEM_AGENT_ID`).
 
+#### Inspect and exercise knowledge intelligence
+
+Open `http://localhost:8080/_dev/#/intelligence`. The workspace includes:
+
+- **Memories:** readable cards first; select one to see its connections and history. The graph is optional.
+- **Try a memory:** with background enrichment enabled, click **Save now** to persist the original immediately, then follow extraction progress and inspect the resulting claims and connections. The advanced transition preview/confirmation workflow remains available.
+- **What is known?:** find memories by project or topic; expand date controls to explore the past.
+- **Saved result:** see clearly whether an attempt was only previewed, recorded as a test, or applied.
+
+JSON, evidence fields, provider settings, retry keys and raw responses are under
+**Advanced**. The other debugging pages remain under **Developer tools**.
+
+With `-dev-ui`, admins can change the authenticated tenant's mode and switch
+between registered provider profiles at runtime, even when startup mode is
+disabled. Choices are durable tenant settings; they do not enable other tenants.
+The default profiles are deterministic and the configured startup planner.
+Additional Ollama/OpenAI-compatible profiles must be explicitly installed and
+configured server-side; credentials never appear in the UI.
+See [Dev UI workflows and runtime profiles](docs/knowledge-intelligence.md#dev-ui-workflows).
+
+For CPU-local Ollama `qwen3:0.6b` background extraction with immediate saves and
+`nomic-embed-text` semantic embeddings:
+
+```sh
+ollama pull qwen3:0.6b
+ollama pull nomic-embed-text
+go run -tags devui ./cmd/niromem serve -dev-ui -mcp -mcp-user my-project -config configs/qwen3.example.json
+```
+
+The **Try a memory** page reports the planner mode, embedding model and actual
+embedding coverage. Existing memories need backfill; **Refresh model status**
+checks progress. With `knowledge.background_enrichment: true`, API facts, MCP
+saves and processed conversation text schedule grounded extraction transactionally.
+Extracted facts carry named entities, evidence, decision classifications and
+optional typed connections/conflict annotations. They are **unreviewed model
+interpretations**, not automatic corrections to previous assertions.
+Set `knowledge.mode` to `shadow` to keep originals but only inspect extraction
+suggestions; `disabled` pauses extraction without blocking explicit saves.
+See [the enrichment contract and CPU benchmark](docs/knowledge-intelligence.md#cpu-first-background-enrichment).
+
 ### 2.2 Connect Claude Code
 
 ```sh
@@ -85,7 +129,9 @@ Expect `ok` from health and `"isError":false` from search. An empty hit list is 
 
 ### 2.3 Talk to it through Claude
 
-The MCP server exposes two tools. Claude calls them when you ask.
+The MCP server exposes two core tools. Claude calls them when you ask.
+Knowledge-capable backends also expose read-only inspection, explanation and
+dry-run proposal tools; see [knowledge intelligence](docs/knowledge-intelligence.md).
 
 | Tool | Arguments | Behavior |
 | --- | --- | --- |
@@ -278,6 +324,11 @@ vector   ran: false  reason: "no query vector and no embedder"
 ```
 
 Enable semantic search by configuring `embedder` (see below). Existing memories have no vectors until you backfill (`POST /v1/vectors/backfill`; check `GET /v1/vectors/coverage` and `GET /v1/vectors/missing`).
+
+Native Ollama and OpenAI-compatible deployments (including LM Studio, vLLM,
+TEI, and LiteLLM) are optional connectors. See the [provider setup guide](docs/embeddings.md)
+and [Ollama server config](configs/ollama.example.json) for model dimensions,
+prefixes, backfill, and local-model query budgets. The `hash` embedder is not semantic.
 
 | Embedder | Notes |
 | --- | --- |

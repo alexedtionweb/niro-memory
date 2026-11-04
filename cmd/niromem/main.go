@@ -111,6 +111,12 @@ func serve(ctx context.Context, log *slog.Logger, args []string) error {
 	if err != nil {
 		return err
 	}
+	if *dev {
+		if err := devAllowed(cfg); err != nil {
+			return err
+		}
+		cfg.knowledgeRuntime = true
+	}
 	reg := metrics.New()
 	e, closeAll, err := open(ctx, cfg, log, reg)
 	if err != nil {

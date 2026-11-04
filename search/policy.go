@@ -33,6 +33,9 @@ type Policy struct {
 	Overfetch int `json:"overfetch"`
 	// GraphHops is how far entity expansion goes: 0 none, 1 direct, 2 neighbours.
 	GraphHops int `json:"graph_hops"`
+	// RelationshipHops optionally expands authorized memory relationships.
+	// Zero preserves existing retrieval; the hard maximum is four.
+	RelationshipHops int `json:"relationship_hops,omitempty"`
 	// Threshold drops hits whose final score is lower.
 	Threshold float64 `json:"threshold"`
 }

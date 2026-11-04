@@ -96,8 +96,10 @@ type Memory struct {
 	// "agent:<id>" or "role:<name>".
 	Grants []string `json:"grants,omitempty"`
 
-	ValidFrom     time.Time  `json:"valid_from"`
-	ValidTo       *time.Time `json:"valid_to,omitempty"`
+	ValidFrom time.Time  `json:"valid_from"`
+	ValidTo   *time.Time `json:"valid_to,omitempty"`
+	// ClosedAt is when the end of validity was learned, not when it happened.
+	ClosedAt      *time.Time `json:"closed_at,omitempty"`
 	RecordedAt    time.Time  `json:"recorded_at"`
 	InvalidatedAt *time.Time `json:"invalidated_at,omitempty"`
 	ExpiresAt     *time.Time `json:"expires_at,omitempty"`

@@ -163,7 +163,7 @@ func (s *Store) retry(ctx context.Context, id, worker string, o store.Outcome, n
 func (s *Store) Jobs(ctx context.Context, q store.JobQuery) ([]store.Job, error) {
 	var conds []string
 	var args []any
-	for col, v := range map[string]string{"tenant": q.Tenant, "state": string(q.State), "kind": q.Kind} {
+	for col, v := range map[string]string{"tenant": q.Tenant, "state": string(q.State), "kind": q.Kind, "key": q.Key} {
 		if v != "" {
 			conds, args = append(conds, col+" = ?"), append(args, v)
 		}

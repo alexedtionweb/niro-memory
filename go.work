@@ -4,6 +4,9 @@ use (
 	.
 	./cmd/niromem
 	./connectors/niro
+	./connectors/inference
+	./connectors/knowledge
+	./connectors/ollama
 	./connectors/openai
 	./connectors/otel
 	./connectors/postgres

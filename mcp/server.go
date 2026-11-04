@@ -136,12 +136,20 @@ func (s *Server) handle(ctx context.Context, req request) (any, *rpcError) {
 	case "ping":
 		return map[string]any{}, nil
 	case "tools/list":
-		return map[string]any{"tools": tools()}, nil
+		return map[string]any{"tools": s.availableTools()}, nil
 	case "tools/call":
 		return s.call(ctx, req.Params)
 	default:
 		return nil, &rpcError{-32601, "method not found"}
 	}
+}
+
+func (s *Server) availableTools() []any {
+	out := tools()
+	if _, ok := s.client.(knowledgeBackend); ok {
+		out = append(out, knowledgeTools()...)
+	}
+	return out
 }
 
 func tools() []any {
@@ -158,8 +166,9 @@ func tools() []any {
 			"name": "remember_memory", "description": "Save a concise, user-approved coding fact, convention, or decision for this project. Never store credentials or secrets.",
 			"inputSchema": map[string]any{
 				"type": "object", "properties": map[string]any{
-					"text": map[string]string{"type": "string", "description": "Durable fact to save, at most 8000 bytes"},
-					"slot": map[string]string{"type": "string", "description": "Optional stable property name, e.g. project.test_command; replaces the previous value for that slot"},
+					"text":          map[string]string{"type": "string", "description": "Durable fact to save, at most 8000 bytes"},
+					"slot":          map[string]string{"type": "string", "description": "Optional stable property name, e.g. project.test_command; replaces the previous value for that slot"},
+					"operation_key": map[string]string{"type": "string", "description": "Optional stable retry key, at most 200 bytes; reuse with identical text and slot after an uncertain save"},
 				},
 				"required": []string{"text"}, "additionalProperties": false,
 			},
@@ -177,9 +186,15 @@ func (s *Server) call(ctx context.Context, raw json.RawMessage) (any, *rpcError)
 		return nil, &rpcError{-32602, "tool name and arguments are required"}
 	}
 	var args struct {
-		Query string `json:"query"`
-		Text  string `json:"text"`
-		Slot  string `json:"slot"`
+		Query        string `json:"query"`
+		Text         string `json:"text"`
+		Slot         string `json:"slot"`
+		OperationKey string `json:"operation_key"`
+		Intent       string `json:"intent"`
+		Subject      string `json:"subject"`
+		Predicate    string `json:"predicate"`
+		Object       string `json:"object"`
+		Key          string `json:"key"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(p.Arguments))
 	decoder.DisallowUnknownFields()
@@ -188,9 +203,23 @@ func (s *Server) call(ctx context.Context, raw json.RawMessage) (any, *rpcError)
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+	knowledgeArgs := map[string]string{
+		"query": args.Query, "text": args.Text, "slot": args.Slot,
+		"operation_key": args.OperationKey, "intent": args.Intent,
+		"subject": args.Subject, "predicate": args.Predicate, "object": args.Object, "key": args.Key,
+	}
+	for name, value := range knowledgeArgs {
+		if value == "" {
+			delete(knowledgeArgs, name)
+		}
+	}
+	if result, handled, err := s.callKnowledge(ctx, p.Name, knowledgeArgs); handled {
+		return result, err
+	}
 	switch p.Name {
 	case "search_memory":
-		if strings.TrimSpace(args.Query) == "" || len(args.Query) > 8000 || args.Text != "" || args.Slot != "" {
+		if strings.TrimSpace(args.Query) == "" || len(args.Query) > 8000 || args.Text != "" || args.Slot != "" ||
+			args.OperationKey != "" || args.Intent != "" || args.Subject != "" || args.Predicate != "" || args.Object != "" || args.Key != "" {
 			return toolResult("Provide only a nonempty query of at most 8000 bytes.", true), nil
 		}
 		result, err := s.client.Search(ctx, client.SearchRequest{SearchRequest: niromem.SearchRequest{
@@ -201,12 +230,14 @@ func (s *Server) call(ctx context.Context, raw json.RawMessage) (any, *rpcError)
 		}
 		return jsonToolResult(result)
 	case "remember_memory":
-		if strings.TrimSpace(args.Text) == "" || len(args.Text) > 8000 || len(args.Slot) > 200 || args.Query != "" {
+		if strings.TrimSpace(args.Text) == "" || len(args.Text) > 8000 || len(args.Slot) > 200 || args.Query != "" ||
+			len(args.OperationKey) > 200 || args.Intent != "" || args.Subject != "" || args.Predicate != "" || args.Object != "" || args.Key != "" {
 			return toolResult("Provide nonempty text of at most 8000 bytes and an optional slot of at most 200 bytes.", true), nil
 		}
 		changes, err := s.client.Remember(ctx, niromem.Fact{
 			Scope: memory.Scope{User: s.user, Agent: s.agent}, Text: args.Text, Slot: args.Slot,
-			Actor: "claude-code-mcp", Metadata: map[string]any{"source": "claude-code-mcp"},
+			OperationKey: args.OperationKey,
+			Actor:        "claude-code-mcp", Metadata: map[string]any{"source": "claude-code-mcp"},
 		})
 		if err != nil {
 			return toolResult("Save failed: "+err.Error(), true), nil

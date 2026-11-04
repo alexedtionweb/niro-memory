@@ -3,21 +3,21 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>niromem · dev console</title>
+  <title>niromem · memory workspace · dev console</title>
   <link rel="stylesheet" href="style.css">
   <script type="module" src="js/app.js"></script>
 </head>
 <body>
   <aside>
-    <div class="brand">niromem <small>dev console</small></div>
-    <nav id="nav"></nav>
+    <div class="brand">niromem <small>Memory workspace</small></div>
+    <nav id="nav" aria-label="Workspace navigation"></nav>
     <div class="conn">
       <label>Tenant <input id="tenant" autocomplete="off"></label>
       <label>API key <input id="key" type="password" placeholder="(dev auth: empty)" autocomplete="off"></label>
       <div id="caps" class="muted"></div>
     </div>
   </aside>
-  <main id="main"></main>
-  <div id="toast"></div>
+  <main id="main" aria-label="Memory workspace"></main>
+  <div id="toast" role="status" aria-live="polite"></div>
 </body>
 </html>

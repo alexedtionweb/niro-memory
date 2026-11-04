@@ -172,3 +172,20 @@ CREATE TABLE IF NOT EXISTS settings (
     tenant text  PRIMARY KEY,
     doc    bytea NOT NULL
 );
+CREATE TABLE IF NOT EXISTS relationship_sets (
+    tenant TEXT NOT NULL,
+    anchor TEXT NOT NULL,
+    data JSONB NOT NULL,
+    PRIMARY KEY (tenant, anchor)
+);
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS closed_at timestamptz;
+CREATE TABLE IF NOT EXISTS operation_receipts (
+    tenant TEXT NOT NULL, key TEXT NOT NULL, hash TEXT NOT NULL, receipt JSONB NOT NULL,
+    PRIMARY KEY (tenant, key)
+);
+CREATE TABLE IF NOT EXISTS knowledge_relations (
+    tenant TEXT NOT NULL, id TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, data JSONB NOT NULL,
+    PRIMARY KEY (tenant, id)
+);
+CREATE INDEX IF NOT EXISTS knowledge_relations_source ON knowledge_relations(tenant, source);
+CREATE INDEX IF NOT EXISTS knowledge_relations_target ON knowledge_relations(tenant, target);

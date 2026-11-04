@@ -4,6 +4,9 @@ go 1.23.0
 
 require (
 	github.com/alexedtionweb/niro-memory v0.0.0
+	github.com/alexedtionweb/niro-memory/connectors/inference v0.0.0
+	github.com/alexedtionweb/niro-memory/connectors/knowledge v0.0.0
+	github.com/alexedtionweb/niro-memory/connectors/ollama v0.0.0
 	github.com/alexedtionweb/niro-memory/connectors/openai v0.0.0
 	github.com/alexedtionweb/niro-memory/connectors/postgres v0.0.0
 	github.com/alexedtionweb/niro-memory/connectors/qdrant v0.0.0
@@ -36,6 +39,9 @@ require (
 // Development: resolve modules from this repository. Released builds pin tags.
 replace (
 	github.com/alexedtionweb/niro-memory => ../..
+	github.com/alexedtionweb/niro-memory/connectors/inference => ../../connectors/inference
+	github.com/alexedtionweb/niro-memory/connectors/knowledge => ../../connectors/knowledge
+	github.com/alexedtionweb/niro-memory/connectors/ollama => ../../connectors/ollama
 	github.com/alexedtionweb/niro-memory/connectors/openai => ../../connectors/openai
 	github.com/alexedtionweb/niro-memory/connectors/postgres => ../../connectors/postgres
 	github.com/alexedtionweb/niro-memory/connectors/qdrant => ../../connectors/qdrant

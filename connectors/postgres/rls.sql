@@ -4,7 +4,7 @@
 DO $$
 DECLARE t text;
 BEGIN
-    FOREACH t IN ARRAY ARRAY['memories','history','entities','entity_aliases','memory_entities','runs','episodes','embeddings','settings'] LOOP
+    FOREACH t IN ARRAY ARRAY['memories','history','entities','entity_aliases','memory_entities','runs','episodes','embeddings','settings','relationship_sets','knowledge_relations','operation_receipts'] LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t); -- owners too
         IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = current_schema() AND tablename = t AND policyname = 'niromem_tenant') THEN

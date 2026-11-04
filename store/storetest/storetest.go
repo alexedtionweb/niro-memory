@@ -53,6 +53,14 @@ func Run(t *testing.T, newStore Factory) {
 		{"Vectors", testVectors},
 		{"Jobs", testJobs},
 		{"ConcurrentSlotWrites", testConcurrentSlots},
+		{"Operations", testOperations},
+		{"RelationHistory", testRelationHistory},
+		{"KnowledgeChecks", testKnowledgeChecks},
+		{"KnownBeforeClosure", testKnownBeforeClosure},
+		{"ReceiptPrivacy", testReceiptPrivacy},
+		{"RelationCloses", testRelationCloses},
+		{"BoundedRelationHistory", testBoundedRelationHistory},
+		{"DependencyClosure", testDependencyClosure},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -647,6 +655,10 @@ func testJobs(t *testing.T, s store.Store) {
 	write(t, s, &store.Batch{Tenant: "t1", Jobs: []store.Job{{Kind: "process", Key: "r1", Payload: json.RawMessage(`{"run":"other"}`)}, {Kind: "process", Key: "r2"}}})
 	write(t, s, &store.Batch{Tenant: "t2", Jobs: []store.Job{{Kind: "process", Key: "r1"}, {Kind: "later", Key: "x", NotBefore: now.Add(time.Hour)}}})
 	pending, _ := s.Jobs(ctx, store.JobQuery{State: store.JobPending})
+	filtered, err := s.Jobs(ctx, store.JobQuery{Tenant: "t1", Kind: "process", Key: "r2", Limit: 1})
+	if err != nil || len(filtered) != 1 || filtered[0].Key != "r2" || filtered[0].Tenant != "t1" {
+		t.Fatalf("exact durable job lookup: %+v %v", filtered, err)
+	}
 	if len(pending) != 4 {
 		t.Fatalf("dedup by key: %d pending", len(pending))
 	}

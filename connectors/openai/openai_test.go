@@ -21,6 +21,7 @@ func TestEmbedder(t *testing.T) {
 			http.Error(w, "slow down", 429) // first call is rate limited
 			return
 		}
+
 		if r.Header.Get("Authorization") != "Bearer k" || r.URL.Path != "/v1/embeddings" {
 			http.Error(w, "bad request", 400)
 			return
@@ -59,5 +60,19 @@ func TestEmbedder(t *testing.T) {
 	bad, _ := openai.New(openai.Options{BaseURL: srv.URL + "/v1", APIKey: "k", Model: "m", Dims: 4})
 	if _, _, err := bad.Embed(context.Background(), embed.Document, []embed.Input{{Text: "x"}}); !errors.Is(err, vector.ErrDims) {
 		t.Fatalf("dimension mismatch must fail: %v", err)
+	}
+}
+
+func TestDuplicateResponseIndex(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data":[{"index":0,"embedding":[1,2]},{"index":0,"embedding":[3,4]}]}`))
+	}))
+	defer srv.Close()
+	e, err := openai.New(openai.Options{BaseURL: srv.URL, Model: "test", Dims: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vectors, _, err := e.Embed(context.Background(), embed.Document, []embed.Input{{Text: "a"}, {Text: "b"}}); err == nil || vectors != nil {
+		t.Fatalf("duplicate response indices accepted: %v %v", vectors, err)
 	}
 }

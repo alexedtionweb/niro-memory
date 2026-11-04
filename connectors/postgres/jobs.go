@@ -144,8 +144,8 @@ func (s *Store) Jobs(ctx context.Context, jq store.JobQuery) ([]store.Job, error
 	if limit <= 0 {
 		limit = 1 << 30
 	}
-	rows, err := s.pool.Query(ctx, `SELECT `+jobCols+` FROM jobs WHERE ($1 = '' OR tenant = $1) AND ($2 = '' OR state = $2) AND ($3 = '' OR kind = $3)
-		ORDER BY id LIMIT $4`, jq.Tenant, string(jq.State), jq.Kind, limit)
+	rows, err := s.pool.Query(ctx, `SELECT `+jobCols+` FROM jobs WHERE ($1 = '' OR tenant = $1) AND ($2 = '' OR state = $2) AND ($3 = '' OR kind = $3) AND ($5 = '' OR key = $5)
+		ORDER BY id LIMIT $4`, jq.Tenant, string(jq.State), jq.Kind, limit, jq.Key)
 	if err != nil {
 		return nil, err
 	}

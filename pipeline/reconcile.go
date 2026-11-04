@@ -33,6 +33,9 @@ import (
 // Proposal is a memory someone wants to store, or an invalidation.
 type Proposal struct {
 	Memory memory.Memory
+	// ForceVersion preserves correction lineage even when identical content
+	// exists elsewhere. The caller must conditionally close the predecessor.
+	ForceVersion bool
 	// Invalidate ends the open value of Memory.Slot instead of adding.
 	Invalidate bool
 	// Match restricts Invalidate to an open value whose text or object
@@ -64,7 +67,7 @@ func Prepare(m *memory.Memory, now time.Time) {
 	if m.ID == "" {
 		m.ID = memory.NewID()
 	}
-	m.Hash = memory.Hash(m.Text)
+	m.Hash = memory.KnowledgeHash(m)
 	m.RecordedAt = now
 	if m.ValidFrom.IsZero() {
 		m.ValidFrom = now
@@ -137,7 +140,7 @@ func (r *Reconciler) Plan(ctx context.Context, tenant string, props []Proposal, 
 			out = append(out, Change{Action: ActionReject, Memory: m, Reason: err.Error()})
 			continue
 		}
-		ch, err := p.add(&m)
+		ch, err := p.add(&m, pr.ForceVersion)
 		if err != nil {
 			return nil, err
 		}
@@ -174,9 +177,9 @@ func (p *planner) stored(f memory.Filter) (*memory.Memory, error) {
 	return &ms[0], nil
 }
 
-func (p *planner) add(m *memory.Memory) (Change, error) {
+func (p *planner) add(m *memory.Memory, forceVersion bool) (Change, error) {
 	hk := m.User + "\x00" + m.Agent + "\x00" + m.Hash
-	if i, ok := p.hashes[hk]; ok { // duplicate inside this batch
+	if i, ok := p.hashes[hk]; ok && !forceVersion { // duplicate inside this batch
 		prev := &p.b.Memories[i]
 		prev.Source.Evidence = append(prev.Source.Evidence, m.Source.Evidence...)
 		return Change{Action: memory.ActionEvidence, Memory: *prev, Reason: "duplicate in batch"}, nil
@@ -185,7 +188,7 @@ func (p *planner) add(m *memory.Memory) (Change, error) {
 	if err != nil {
 		return Change{}, err
 	}
-	if dup != nil {
+	if dup != nil && !forceVersion {
 		heat := int64(1)
 		if p.r.NoHeat {
 			heat = 0
@@ -242,6 +245,8 @@ func (p *planner) closeStored(old *memory.Memory, at time.Time) memory.Action {
 	action := memory.ActionSupersede
 	if at.After(old.ValidFrom) {
 		c.ValidTo = &at
+		now := p.now
+		c.ClosedAt = &now
 	} else {
 		now := p.now
 		c.InvalidatedAt = &now
@@ -254,6 +259,8 @@ func (p *planner) closeStored(old *memory.Memory, at time.Time) memory.Action {
 func (p *planner) closeInBatch(prev *memory.Memory, at time.Time) {
 	if at.After(prev.ValidFrom) {
 		prev.ValidTo = &at
+		now := p.now
+		prev.ClosedAt = &now
 		return
 	}
 	now := p.now

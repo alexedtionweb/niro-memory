@@ -2,10 +2,12 @@ package niromem
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
+	"github.com/alexedtionweb/niro-memory/knowledge"
 	"github.com/alexedtionweb/niro-memory/memory"
 	"github.com/alexedtionweb/niro-memory/pipeline"
 	"github.com/alexedtionweb/niro-memory/store"
@@ -16,17 +18,21 @@ import (
 // primary, most precise way to remember something.
 type Fact struct {
 	memory.Scope
-	Kind      memory.Kind        `json:"kind,omitempty"`  // default semantic
-	Layer     memory.Layer       `json:"layer,omitempty"` // default atom
-	Title     string             `json:"title,omitempty"`
-	Text      string             `json:"text"`
-	Subject   string             `json:"subject,omitempty"`
-	Predicate string             `json:"predicate,omitempty"`
-	Object    string             `json:"object,omitempty"`
-	Slot      string             `json:"slot,omitempty"`
-	Tags      []string           `json:"tags,omitempty"`
-	Metadata  map[string]any     `json:"metadata,omitempty"`
-	Entities  []memory.EntityRef `json:"entities,omitempty"`
+	Kind      memory.Kind              `json:"kind,omitempty"`  // default semantic
+	Layer     memory.Layer             `json:"layer,omitempty"` // default atom
+	Title     string                   `json:"title,omitempty"`
+	Text      string                   `json:"text"`
+	Subject   string                   `json:"subject,omitempty"`
+	Predicate string                   `json:"predicate,omitempty"`
+	Object    string                   `json:"object,omitempty"`
+	Slot      string                   `json:"slot,omitempty"`
+	Tags      []string                 `json:"tags,omitempty"`
+	Metadata  map[string]any           `json:"metadata,omitempty"`
+	Assertion *memory.Assertion        `json:"assertion,omitempty"`
+	Decision  *memory.DecisionMetadata `json:"decision,omitempty"`
+	// OperationKey allows a caller to retry a write across process restarts.
+	OperationKey string             `json:"operation_key,omitempty"`
+	Entities     []memory.EntityRef `json:"entities,omitempty"`
 	// Confidence and Importance default to 1.0 and 0.5 when zero.
 	Confidence float64           `json:"confidence,omitempty"`
 	Importance float64           `json:"importance,omitempty"`
@@ -100,14 +106,51 @@ func (e *Engine) Remember(ctx context.Context, facts ...Fact) (changes []pipelin
 		if err := checkVectors(models, f.Vectors); err != nil {
 			return nil, err
 		}
+		if len(f.OperationKey) > 200 || f.OperationKey != "" && f.OperationKey != facts[0].OperationKey {
+			return nil, fmt.Errorf("%w: facts must share one operation key of at most 200 bytes", memory.ErrInvalid)
+		}
 	}
-	_, err = e.write(ctx, func() (*store.Batch, error) {
+	key := facts[0].OperationKey
+	if key == "" {
+		key = memory.NewID()
+	}
+	hash, err := operationHash(facts)
+	if err != nil {
+		return nil, err
+	}
+	if replayed, err := e.replayOperation(ctx, tenant, "remember:"+key, hash, &changes); replayed || err != nil {
+		return changes, err
+	}
+	receipt, err := e.write(ctx, func() (*store.Batch, error) {
 		now := e.o.Now()
 		props := make([]pipeline.Proposal, len(facts))
 		for i, f := range facts {
-			props[i] = pipeline.Proposal{Memory: f.memory(now), Invalidate: f.Invalidate, Match: f.Match}
+			m := f.memory(now)
+			m.Metadata, err = memory.WithKnowledgeMetadata(m.Metadata, f.Assertion, f.Decision)
+			if err != nil {
+				return nil, err
+			}
+			assertion, err := memory.ReadAssertion(m)
+			if err != nil {
+				return nil, err
+			}
+			if assertion != nil {
+				m.Subject, m.Predicate, m.Object = assertion.Subject, assertion.Predicate, assertion.Object
+			}
+			decision, err := memory.ReadDecision(m)
+			if err != nil {
+				return nil, err
+			}
+			if assertion != nil || decision != nil {
+				if err := e.validateKnowledgeEvidence(ctx, KnowledgeRequest{Input: knowledge.Input{
+					Scope: f.Scope, Assertion: assertion, Decision: decision, Evidence: f.Evidence,
+					Visibility: f.Visibility, Grants: f.Grants}}); err != nil {
+					return nil, err
+				}
+			}
+			props[i] = pipeline.Proposal{Memory: m, Invalidate: f.Invalidate, Match: f.Match}
 		}
-		b := &store.Batch{Tenant: tenant}
+		b := &store.Batch{Tenant: tenant, OperationKey: "remember:" + key, OperationHash: hash}
 		changes, err = e.rec.Plan(ctx, tenant, props, b)
 		if err != nil {
 			return nil, err
@@ -118,8 +161,15 @@ func (e *Engine) Remember(ctx context.Context, facts ...Fact) (changes []pipelin
 			}
 		}
 		e.followUp(b, changes)
+		b.Result, err = json.Marshal(changes)
+		if err != nil {
+			return nil, err
+		}
 		return b, nil
 	})
+	if err == nil && receipt.Replayed {
+		err = json.Unmarshal(receipt.Result, &changes)
+	}
 	return changes, err
 }
 
@@ -274,18 +324,19 @@ func (e *Engine) Versions(ctx context.Context, tenant, id string) ([]memory.Memo
 
 // Patch corrects a memory. Nil fields are kept.
 type Patch struct {
-	Text       *string            `json:"text,omitempty"`
-	Title      *string            `json:"title,omitempty"`
-	Tags       *[]string          `json:"tags,omitempty"`
-	Metadata   map[string]any     `json:"metadata,omitempty"`
-	Confidence *float64           `json:"confidence,omitempty"`
-	Importance *float64           `json:"importance,omitempty"`
-	Visibility *memory.Visibility `json:"visibility,omitempty"`
-	Grants     *[]string          `json:"grants,omitempty"`
-	ExpiresAt  *time.Time         `json:"expires_at,omitempty"`
-	Vectors    []Vector           `json:"vectors,omitempty"`
-	Actor      string             `json:"actor,omitempty"`
-	Reason     string             `json:"reason,omitempty"`
+	OperationKey string             `json:"operation_key,omitempty"`
+	Text         *string            `json:"text,omitempty"`
+	Title        *string            `json:"title,omitempty"`
+	Tags         *[]string          `json:"tags,omitempty"`
+	Metadata     map[string]any     `json:"metadata,omitempty"`
+	Confidence   *float64           `json:"confidence,omitempty"`
+	Importance   *float64           `json:"importance,omitempty"`
+	Visibility   *memory.Visibility `json:"visibility,omitempty"`
+	Grants       *[]string          `json:"grants,omitempty"`
+	ExpiresAt    *time.Time         `json:"expires_at,omitempty"`
+	Vectors      []Vector           `json:"vectors,omitempty"`
+	Actor        string             `json:"actor,omitempty"`
+	Reason       string             `json:"reason,omitempty"`
 }
 
 // Update corrects an open memory: the old version is invalidated (it was
@@ -293,6 +344,9 @@ type Patch struct {
 // slot when the world changed instead.
 func (e *Engine) Update(ctx context.Context, tenant, id string, p Patch) (m memory.Memory, err error) {
 	defer e.observe("update", time.Now(), err)
+	if len(p.OperationKey) > 200 {
+		return m, fmt.Errorf("%w: operation key exceeds 200 bytes", memory.ErrInvalid)
+	}
 	s, err := e.Settings(ctx, tenant)
 	if err != nil {
 		return m, err
@@ -301,7 +355,22 @@ func (e *Engine) Update(ctx context.Context, tenant, id string, p Patch) (m memo
 	if err := checkVectors(models, p.Vectors); err != nil {
 		return m, err
 	}
-	_, err = e.write(ctx, func() (*store.Batch, error) {
+	hash, err := operationHash(struct {
+		ID    string
+		Patch Patch
+	}{id, p})
+	if err != nil {
+		return m, err
+	}
+	key := p.OperationKey
+	if key == "" {
+		key = hash
+	}
+	key = "update:" + key
+	if replayed, err := e.replayOperation(ctx, tenant, key, hash, &m); replayed || err != nil {
+		return m, err
+	}
+	receipt, err := e.write(ctx, func() (*store.Batch, error) {
 		ms, err := e.o.Store.Get(ctx, tenant, []string{id})
 		if err != nil {
 			return nil, err
@@ -348,7 +417,7 @@ func (e *Engine) Update(ctx context.Context, tenant, id string, p Patch) (m memo
 		if err := m.Validate(e.o.Limits); err != nil {
 			return nil, err
 		}
-		b := &store.Batch{Tenant: tenant,
+		b := &store.Batch{Tenant: tenant, OperationKey: key, OperationHash: hash,
 			Closes:   []store.Close{{ID: old.ID, InvalidatedAt: &now}},
 			Memories: []memory.Memory{m},
 			Events: []memory.Event{
@@ -357,8 +426,15 @@ func (e *Engine) Update(ctx context.Context, tenant, id string, p Patch) (m memo
 			}}
 		e.attachVectors(b, m, p.Vectors)
 		e.followUp(b, []pipeline.Change{{Action: memory.ActionAdd, Memory: m}})
+		b.Result, err = json.Marshal(m)
+		if err != nil {
+			return nil, err
+		}
 		return b, nil
 	})
+	if err == nil && receipt.Replayed {
+		err = json.Unmarshal(receipt.Result, &m)
+	}
 	return m, err
 }
 
@@ -367,7 +443,29 @@ func pipelinePrepare(m *memory.Memory, now time.Time) { pipeline.Prepare(m, now)
 // Invalidate ends a memory's validity at time at (zero = now): the fact
 // stopped being true. If at is not after its start, it is invalidated instead.
 func (e *Engine) Invalidate(ctx context.Context, tenant, id string, at time.Time, actor, reason string) (err error) {
+	return e.InvalidateWithKey(ctx, tenant, id, "", at, actor, reason)
+}
+
+func (e *Engine) InvalidateWithKey(ctx context.Context, tenant, id, key string, at time.Time, actor, reason string) (err error) {
 	defer e.observe("invalidate", time.Now(), err)
+	if len(key) > 200 {
+		return fmt.Errorf("%w: operation key exceeds 200 bytes", memory.ErrInvalid)
+	}
+	hash, err := operationHash(struct {
+		ID, Actor, Reason string
+		At                time.Time
+	}{id, actor, reason, at})
+	if err != nil {
+		return err
+	}
+	if key == "" {
+		key = hash
+	}
+	key = "invalidate:" + key
+	var completed map[string]string
+	if replayed, err := e.replayOperation(ctx, tenant, key, hash, &completed); replayed || err != nil {
+		return err
+	}
 	_, err = e.write(ctx, func() (*store.Batch, error) {
 		ms, err := e.o.Store.Get(ctx, tenant, []string{id})
 		if err != nil {
@@ -383,10 +481,12 @@ func (e *Engine) Invalidate(ctx context.Context, tenant, id string, at time.Time
 		c := store.Close{ID: id}
 		if at.After(ms[0].ValidFrom) {
 			c.ValidTo = &at
+			c.ClosedAt = &now
 		} else {
 			c.InvalidatedAt = &now
 		}
-		return &store.Batch{Tenant: tenant, Closes: []store.Close{c},
+		return &store.Batch{Tenant: tenant, OperationKey: key, OperationHash: hash,
+			Result: payload(map[string]string{"status": "invalidated", "id": id}), Closes: []store.Close{c},
 			Events: []memory.Event{{MemoryID: id, Action: memory.ActionInvalidate, Old: ms[0].Text, Actor: actor, Reason: reason, At: now}}}, nil
 	})
 	return err
@@ -395,12 +495,35 @@ func (e *Engine) Invalidate(ctx context.Context, tenant, id string, at time.Time
 // Delete permanently removes memories with their vectors and entity links.
 // Their history keeps the audit trail (actions and times) without content.
 func (e *Engine) Delete(ctx context.Context, tenant, actor string, ids ...string) (err error) {
+	return e.DeleteWithKey(ctx, tenant, actor, "", ids...)
+}
+
+func (e *Engine) DeleteWithKey(ctx context.Context, tenant, actor, key string, ids ...string) (err error) {
 	defer e.observe("delete", time.Now(), err)
+	if len(key) > 200 {
+		return fmt.Errorf("%w: operation key exceeds 200 bytes", memory.ErrInvalid)
+	}
 	if len(ids) == 0 {
 		return nil
 	}
+	hash, err := operationHash(struct {
+		IDs   []string
+		Actor string
+	}{ids, actor})
+	if err != nil {
+		return err
+	}
+	if key == "" {
+		key = hash
+	}
+	key = "delete:" + key
+	var completed map[string]string
+	if replayed, err := e.replayOperation(ctx, tenant, key, hash, &completed); replayed || err != nil {
+		return err
+	}
 	now := e.o.Now()
-	b := &store.Batch{Tenant: tenant, Deletes: ids}
+	b := &store.Batch{Tenant: tenant, OperationKey: key, OperationHash: hash,
+		Result: payload(map[string]string{"status": "deleted"}), Deletes: ids}
 	var targets []vector.Target
 	for _, id := range ids {
 		b.Events = append(b.Events, memory.Event{MemoryID: id, Action: memory.ActionDelete, Actor: actor, At: now})

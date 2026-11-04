@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/alexedtionweb/niro-memory/memory"
+	"github.com/alexedtionweb/niro-memory/relations"
 	"github.com/alexedtionweb/niro-memory/vector"
 )
 
@@ -54,10 +55,16 @@ type Reader interface {
 	Settings(ctx context.Context, tenant string) ([]byte, error)
 }
 
-// Batch is a unit of work. Stores apply its sections in the order they are
-// declared below, inside one transaction.
+// Batch is a unit of work. Replay is resolved first, then Checks, before any
+// domain mutations. Relations follow memory insertion and precede deletion.
 type Batch struct {
-	Tenant string
+	Tenant         string
+	OperationKey   string
+	OperationHash  string
+	Result         json.RawMessage
+	Checks         []Check
+	Relations      []relations.Link
+	RelationCloses []relations.Close
 
 	// Memories are inserted. The store resolves EntityRefs to entity rows
 	// (creating them by key) and links them. Inserting a current memory whose
@@ -109,7 +116,19 @@ type Batch struct {
 func (b *Batch) Empty() bool {
 	return len(b.Memories)+len(b.Closes)+len(b.Touches)+len(b.Deletes)+len(b.Events)+
 		len(b.Episodes)+len(b.EpisodeEdits)+len(b.DeleteRuns)+len(b.Cursors)+len(b.Summaries)+
-		len(b.Vectors)+len(b.VectorDeletes)+len(b.Aliases)+len(b.Jobs) == 0 && b.Settings == nil
+		len(b.Vectors)+len(b.VectorDeletes)+len(b.Aliases)+len(b.Jobs)+len(b.Relations)+len(b.RelationCloses)+len(b.Checks) == 0 && b.Settings == nil && b.OperationKey == ""
+}
+
+// Check rejects a stale plan before any mutations. Open requires an open row.
+type Check struct {
+	ID      string
+	Version int
+	Open    bool
+}
+
+// Operations reads committed operation receipts, or memory.ErrNotFound.
+type Operations interface {
+	Operation(context.Context, string, string) (*Receipt, error)
 }
 
 // Close ends a memory version. It fails with memory.ErrConflict unless the
@@ -118,6 +137,7 @@ type Close struct {
 	ID            string
 	ValidTo       *time.Time // world change: the fact stopped being true
 	InvalidatedAt *time.Time // correction: the fact was never true
+	ClosedAt      *time.Time // system time ValidTo was learned; nil uses the store clock
 }
 
 // Touch records that an existing memory was seen again.
@@ -156,7 +176,10 @@ type Alias struct {
 
 // Receipt reports what a Write did.
 type Receipt struct {
-	Episodes []EpisodeResult
+	Episodes      []EpisodeResult
+	Result        json.RawMessage
+	Replayed      bool
+	OperationHash string
 }
 
 // EpisodeResult is the stored form of one appended episode.
@@ -363,5 +386,6 @@ type JobQuery struct {
 	Tenant string
 	State  JobState
 	Kind   string
+	Key    string
 	Limit  int
 }

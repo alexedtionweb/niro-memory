@@ -8,10 +8,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	niromem "github.com/alexedtionweb/niro-memory"
 	"github.com/alexedtionweb/niro-memory/api"
 	"github.com/alexedtionweb/niro-memory/client"
+	"github.com/alexedtionweb/niro-memory/knowledge"
 	"github.com/alexedtionweb/niro-memory/memory"
 	"github.com/alexedtionweb/niro-memory/store/memstore"
 )
@@ -121,5 +123,60 @@ func TestToolFailuresAreExplicit(t *testing.T) {
 	}
 	if res[3].Error == nil || res[3].Error.Code != -32602 {
 		t.Fatalf("unknown tool: %+v", res[3])
+	}
+}
+
+func TestKnowledgeToolsAreScopedAndDryRun(t *testing.T) {
+	ctx := context.Background()
+	engine, err := niromem.Open(niromem.Options{
+		Store: memstore.New(nil),
+		Knowledge: niromem.KnowledgeOptions{
+			Mode: "shadow", Planner: knowledge.Deterministic{}, Timeout: 2 * time.Second,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { engine.Close() })
+	const key = "test-knowledge-mcp-key-012345"
+	auth, err := api.NewKeys([]api.Key{{Key: key, Tenant: "dev", User: "my-project", Agent: "claude-code"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer((&api.Server{Engine: engine, Auth: auth}).Handler())
+	defer httpServer.Close()
+	c := client.New(httpServer.URL, key)
+	s := &Server{client: c, user: "my-project", agent: "claude-code"}
+
+	res := exchange(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"propose_memory_update","arguments":{"operation_key":"mcp-proposal","text":"The service uses Go","slot":"project.language"}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"propose_memory_update","arguments":{"operation_key":"bad-scope","text":"leak","user_id":"another-project"}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"inspect_knowledge","arguments":{"slot":"project.language"}}}
+`)
+	tools := res[0].Result.(map[string]any)["tools"].([]any)
+	if len(tools) != 6 {
+		t.Fatalf("knowledge tools were not exposed: %d", len(tools))
+	}
+	for _, response := range res[1:] {
+		if response.Error != nil {
+			t.Fatalf("JSON-RPC error: %+v", response)
+		}
+	}
+	if res[1].Result.(map[string]any)["isError"] != false {
+		t.Fatalf("dry-run failed: %+v", res[1])
+	}
+	if res[2].Result.(map[string]any)["isError"] != true {
+		t.Fatalf("caller-controlled scope was accepted: %+v", res[2])
+	}
+	if res[3].Result.(map[string]any)["isError"] != false {
+		t.Fatalf("read-only inspect failed: %+v", res[3])
+	}
+	memories, err := c.List(ctx, "my-project", "claude-code", 10)
+	if err != nil || len(memories) != 0 {
+		t.Fatalf("proposal committed a memory: %d %v", len(memories), err)
+	}
+	if _, err := c.KnowledgeTrace(ctx, "mcp-proposal"); err == nil {
+		t.Fatal("dry-run unexpectedly produced a committed trace")
 	}
 }

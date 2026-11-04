@@ -363,6 +363,17 @@ func (s *Searcher) hybrid(ctx context.Context, r Request, q store.Query, now tim
 	if len(errs) > 0 && len(c.cands) == 0 {
 		return nil, errors.Join(errs...)
 	}
+	if r.Policy.RelationshipHops != 0 {
+		t := time.Now()
+		count, err := s.relationshipCandidates(ctx, r, q, now, c, min(n, 400))
+		if err != nil {
+			return nil, err
+		}
+		if count > 0 {
+			active["entity"] = true
+		}
+		c.step(Step{Strategy: "relationships", Ran: true, Candidates: count, Took: time.Since(t)})
+	}
 	return s.rank(ctx, r, q, now, c, active, len(terms))
 }
 

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -160,9 +161,9 @@ func (m *Memory) Validate(l Limits) error {
 		return invalid("text is %d bytes, limit %d", len(m.Text), l.MaxTextBytes)
 	case len(m.Tags) > l.MaxTags:
 		return invalid("%d tags, limit %d", len(m.Tags), l.MaxTags)
-	case m.Confidence < 0 || m.Confidence > 1:
+	case math.IsNaN(m.Confidence) || math.IsInf(m.Confidence, 0) || m.Confidence < 0 || m.Confidence > 1:
 		return invalid("confidence %v outside [0,1]", m.Confidence)
-	case m.Importance < 0 || m.Importance > 1:
+	case math.IsNaN(m.Importance) || math.IsInf(m.Importance, 0) || m.Importance < 0 || m.Importance > 1:
 		return invalid("importance %v outside [0,1]", m.Importance)
 	case m.Layer < Atom || m.Layer > Profile:
 		return invalid("layer %d outside 1..3", m.Layer)
@@ -184,5 +185,5 @@ func (m *Memory) Validate(l Limits) error {
 			return invalid("grant %q must be user:<id>, agent:<id> or role:<name>", g)
 		}
 	}
-	return nil
+	return ValidateKnowledge(m)
 }

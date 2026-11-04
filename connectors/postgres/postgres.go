@@ -218,17 +218,15 @@ func (s *Store) Write(ctx context.Context, b *store.Batch) (*store.Receipt, erro
 	if b.Tenant == "" {
 		return nil, fmt.Errorf("%w: tenant is required", memory.ErrInvalid)
 	}
-	for _, p := range b.Vectors {
-		if vector.Normalize(append([]float32(nil), p.Values...)) != nil || p.Model == "" || p.Target.ID == "" {
-			return nil, fmt.Errorf("%w: bad vector for %s", memory.ErrInvalid, p.Target.Key())
-		}
-	}
 	var rec *store.Receipt
 	err := pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
 		if s.rls {
 			if _, err := tx.Exec(ctx, `SELECT set_config('niromem.tenant', $1, true)`, b.Tenant); err != nil {
 				return err
 			}
+		}
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "niromem.write:"+b.Tenant); err != nil {
+			return err
 		}
 		var err error
 		rec, err = (&writer{tx: tx, ctx: ctx, t: b.Tenant, now: utc(s.now())}).apply(b)
@@ -244,10 +242,11 @@ func (s *Store) Write(ctx context.Context, b *store.Batch) (*store.Receipt, erro
 }
 
 type writer struct {
-	tx  pgx.Tx
-	ctx context.Context
-	t   string
-	now time.Time
+	tx           pgx.Tx
+	ctx          context.Context
+	t            string
+	now          time.Time
+	relationJobs []store.Job
 }
 
 func (w *writer) exec(sql string, args ...any) (int64, error) {
@@ -256,9 +255,25 @@ func (w *writer) exec(sql string, args ...any) (int64, error) {
 }
 
 func (w *writer) apply(b *store.Batch) (*store.Receipt, error) {
+	if rec, err := w.replay(b); rec != nil || err != nil {
+		return rec, err
+	}
+	if err := w.checkBatch(b); err != nil {
+		return nil, err
+	}
+	for _, p := range b.Vectors {
+		if vector.Normalize(append([]float32(nil), p.Values...)) != nil || p.Model == "" || p.Target.ID == "" {
+			return nil, fmt.Errorf("%w: bad vector for %s", memory.ErrInvalid, p.Target.Key())
+		}
+	}
 	for _, c := range b.Closes {
-		n, err := w.exec(`UPDATE memories SET valid_to = COALESCE($1, valid_to), invalidated_at = COALESCE($2, invalidated_at)
-			WHERE tenant = $3 AND id = $4 AND valid_to IS NULL AND invalidated_at IS NULL`, utcPtr(c.ValidTo), utcPtr(c.InvalidatedAt), w.t, c.ID)
+		at := w.now
+		if c.ClosedAt != nil {
+			at = utc(*c.ClosedAt)
+		}
+		n, err := w.exec(`UPDATE memories SET valid_to = COALESCE($1, valid_to), invalidated_at = COALESCE($2, invalidated_at),
+			closed_at = CASE WHEN $1::timestamptz IS NOT NULL THEN $3 ELSE closed_at END
+			WHERE tenant = $4 AND id = $5 AND valid_to IS NULL AND invalidated_at IS NULL`, utcPtr(c.ValidTo), utcPtr(c.InvalidatedAt), at, w.t, c.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -270,6 +285,9 @@ func (w *writer) apply(b *store.Batch) (*store.Receipt, error) {
 		if err := w.insertMemory(&b.Memories[i]); err != nil {
 			return nil, err
 		}
+	}
+	if err := w.relations(b); err != nil {
+		return nil, err
 	}
 	for _, tc := range b.Touches {
 		if _, err := w.exec(`UPDATE memories SET heat = heat + $1,
@@ -284,6 +302,8 @@ func (w *writer) apply(b *store.Batch) (*store.Receipt, error) {
 			`DELETE FROM memory_entities WHERE tenant = $1 AND memory_id = $2`,
 			`DELETE FROM embeddings WHERE tenant = $1 AND target_key = 'm:' || $2`,
 			`UPDATE history SET old = '', new = '' WHERE tenant = $1 AND memory_id = $2`,
+			`DELETE FROM relationship_sets WHERE tenant = $1 AND (anchor = $2 OR data @> jsonb_build_array(jsonb_build_object('target_id', $2::text)))`,
+			`DELETE FROM knowledge_relations WHERE tenant = $1 AND (source = $2 OR target = $2)`,
 			`DELETE FROM memories WHERE tenant = $1 AND id = $2`,
 		} {
 			if _, err := w.exec(sql, w.t, id); err != nil {
@@ -297,7 +317,7 @@ func (w *writer) apply(b *store.Batch) (*store.Receipt, error) {
 			return nil, err
 		}
 	}
-	rec := &store.Receipt{}
+	rec := &store.Receipt{Result: append(json.RawMessage(nil), b.Result...), OperationHash: b.OperationHash}
 	for i := range b.Episodes {
 		r, err := w.appendEpisode(&b.Episodes[i])
 		if err != nil {
@@ -372,8 +392,26 @@ func (w *writer) apply(b *store.Batch) (*store.Receipt, error) {
 			return nil, err
 		}
 	}
+	for _, j := range w.relationJobs {
+		if err := w.enqueue(j); err != nil {
+			return nil, err
+		}
+	}
 	if b.Settings != nil {
 		if _, err := w.exec(`INSERT INTO settings (tenant, doc) VALUES ($1, $2) ON CONFLICT (tenant) DO UPDATE SET doc = excluded.doc`, w.t, b.Settings); err != nil {
+			return nil, err
+		}
+	}
+	if err := w.redactOperations(b.Deletes); err != nil {
+		return nil, err
+	}
+	store.RedactReceipt(rec, b.Deletes)
+	if b.OperationKey != "" {
+		raw, err := store.EncodeReceipt(rec)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := w.exec(`INSERT INTO operation_receipts(tenant,key,hash,receipt) VALUES($1,$2,$3,$4)`, w.t, b.OperationKey, b.OperationHash, raw); err != nil {
 			return nil, err
 		}
 	}
@@ -393,13 +431,13 @@ func (w *writer) insertMemory(m *memory.Memory) error {
 	}
 	_, err := w.exec(`INSERT INTO memories (tenant, id, user_id, agent_id, run_id, kind, layer, title, text, subject, predicate, object,
 		slot, hash, tags, metadata, confidence, importance, heat, visibility, grants, valid_from, valid_to, recorded_at,
-		invalidated_at, expires_at, version, supersedes, src_kind, actor, role, trust, derived_by, source, fts_scope)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35)`,
+		invalidated_at, expires_at, version, supersedes, src_kind, actor, role, trust, derived_by, source, fts_scope, closed_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36)`,
 		w.t, m.ID, m.User, m.Agent, m.Run, string(m.Kind), int(m.Layer), m.Title, m.Text, m.Subject, m.Predicate, m.Object,
 		m.Slot, m.Hash, jsList(m.Tags), metaJSON(m.Metadata), m.Confidence, m.Importance, m.Heat, string(m.Visibility), jsList(m.Grants),
 		utc(m.ValidFrom), utcPtr(m.ValidTo), utc(m.RecordedAt), utcPtr(m.InvalidatedAt), utcPtr(m.ExpiresAt),
 		m.Version, m.Supersedes, m.Source.Kind, m.Source.Actor, m.Source.Role, string(m.Source.Trust), m.Source.DerivedBy, js(m.Source),
-		sqlgen.TenantToken(w.t)+" "+sqlgen.UserToken(w.t, m.User))
+		sqlgen.TenantToken(w.t)+" "+sqlgen.UserToken(w.t, m.User), utcPtr(m.ClosedAt))
 	if err != nil {
 		return err
 	}
@@ -493,7 +531,7 @@ func (w *writer) enqueue(j store.Job) error {
 
 const memCols = `m.id, m.user_id, m.agent_id, m.run_id, m.kind, m.layer, m.title, m.text, m.subject, m.predicate, m.object,
 	m.slot, m.hash, m.tags, m.metadata, m.confidence, m.importance, m.heat, m.visibility, m.grants, m.valid_from, m.valid_to,
-	m.recorded_at, m.invalidated_at, m.expires_at, m.version, m.supersedes, m.source`
+	m.recorded_at, m.invalidated_at, m.expires_at, m.version, m.supersedes, m.source, m.closed_at`
 
 func scanMemory(r pgx.Row, tenant string) (memory.Memory, error) {
 	var m memory.Memory
@@ -502,13 +540,13 @@ func scanMemory(r pgx.Row, tenant string) (memory.Memory, error) {
 	var tags, meta, grants, src []byte
 	err := r.Scan(&m.ID, &m.User, &m.Agent, &m.Run, &kind, &layer, &m.Title, &m.Text, &m.Subject, &m.Predicate, &m.Object,
 		&m.Slot, &m.Hash, &tags, &meta, &m.Confidence, &m.Importance, &m.Heat, &vis, &grants, &m.ValidFrom, &m.ValidTo,
-		&m.RecordedAt, &m.InvalidatedAt, &m.ExpiresAt, &m.Version, &m.Supersedes, &src)
+		&m.RecordedAt, &m.InvalidatedAt, &m.ExpiresAt, &m.Version, &m.Supersedes, &src, &m.ClosedAt)
 	if err != nil {
 		return m, err
 	}
 	m.Tenant, m.Kind, m.Layer, m.Visibility = tenant, memory.Kind(kind), memory.Layer(layer), memory.Visibility(vis)
 	m.ValidFrom, m.RecordedAt = m.ValidFrom.UTC(), m.RecordedAt.UTC()
-	for _, p := range []**time.Time{&m.ValidTo, &m.InvalidatedAt, &m.ExpiresAt} {
+	for _, p := range []**time.Time{&m.ValidTo, &m.InvalidatedAt, &m.ExpiresAt, &m.ClosedAt} {
 		if *p != nil {
 			v := (*p).UTC()
 			*p = &v

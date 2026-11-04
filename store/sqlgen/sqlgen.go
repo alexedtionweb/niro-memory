@@ -288,7 +288,7 @@ func (b *Builder) Temporal(q store.Query, now time.Time) string {
 			col("recorded_at")+" <= "+k,
 			"("+col("invalidated_at")+" IS NULL OR "+col("invalidated_at")+" > "+k+")",
 			col("valid_from")+" <= "+v,
-			"("+col("valid_to")+" IS NULL OR "+col("valid_to")+" > "+v+")")
+			"("+col("valid_to")+" IS NULL OR "+col("valid_to")+" > "+v+" OR "+col("closed_at")+" > "+k+")")
 	}
 	if len(conds) == 0 {
 		return "1=1"

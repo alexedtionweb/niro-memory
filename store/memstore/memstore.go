@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/alexedtionweb/niro-memory/memory"
+	"github.com/alexedtionweb/niro-memory/relations"
 	"github.com/alexedtionweb/niro-memory/store"
 	"github.com/alexedtionweb/niro-memory/textutil"
 	"github.com/alexedtionweb/niro-memory/vector"
@@ -30,20 +31,22 @@ type Store struct {
 }
 
 type tenant struct {
-	mems      map[string]*memory.Memory
-	slots     map[string]string // slot key -> open memory id
-	history   map[string][]memory.Event
-	episodes  map[string]*memory.Episode
-	runEps    map[string][]string // run -> episode ids in seq order
-	clientIDs map[string]string   // run\x00client id -> episode id
-	runs      map[string]*memory.Run
-	entities  map[string]*memory.Entity // by key
-	byID      map[string]*memory.Entity
-	aliases   map[string]string          // alias key -> entity key
-	links     map[string]map[string]bool // entity id -> memory ids
-	memEnts   map[string][]string        // memory id -> entity ids
-	vectors   map[string]map[string]vector.Point
-	settings  []byte
+	mems          map[string]*memory.Memory
+	slots         map[string]string // slot key -> open memory id
+	history       map[string][]memory.Event
+	episodes      map[string]*memory.Episode
+	runEps        map[string][]string // run -> episode ids in seq order
+	clientIDs     map[string]string   // run\x00client id -> episode id
+	runs          map[string]*memory.Run
+	entities      map[string]*memory.Entity // by key
+	byID          map[string]*memory.Entity
+	aliases       map[string]string          // alias key -> entity key
+	links         map[string]map[string]bool // entity id -> memory ids
+	memEnts       map[string][]string        // memory id -> entity ids
+	vectors       map[string]map[string]vector.Point
+	settings      []byte
+	relationships map[string]relations.Link
+	operations    map[string]*store.Receipt
 }
 
 // New returns an empty store. now may be nil (time.Now).
@@ -62,7 +65,9 @@ func (s *Store) t(name string) *tenant {
 			episodes: map[string]*memory.Episode{}, runEps: map[string][]string{}, clientIDs: map[string]string{},
 			runs: map[string]*memory.Run{}, entities: map[string]*memory.Entity{}, byID: map[string]*memory.Entity{},
 			aliases: map[string]string{}, links: map[string]map[string]bool{}, memEnts: map[string][]string{},
-			vectors: map[string]map[string]vector.Point{},
+			vectors:       map[string]map[string]vector.Point{},
+			relationships: map[string]relations.Link{},
+			operations:    map[string]*store.Receipt{},
 		}
 		s.tenants[name] = t
 	}
@@ -89,7 +94,35 @@ func (s *Store) Write(_ context.Context, b *store.Batch) (*store.Receipt, error)
 	defer s.mu.Unlock()
 	t := s.t(b.Tenant)
 	now := s.now()
+	if b.OperationKey != "" {
+		if rec := t.operations[b.OperationKey]; rec != nil {
+			if rec.OperationHash != b.OperationHash {
+				return nil, conflict("operation hash changed")
+			}
+			out := cloneReceipt(rec)
+			out.Replayed = true
+			return out, nil
+		}
+	}
+	if len(b.Result) != 0 && !json.Valid(b.Result) {
+		return nil, fmt.Errorf("%w: invalid result JSON", memory.ErrInvalid)
+	}
+	if _, err := json.Marshal(b); err != nil {
+		return nil, fmt.Errorf("%w: batch cannot be encoded: %v", memory.ErrInvalid, err)
+	}
 	if err := s.check(t, b); err != nil {
+		return nil, err
+	}
+	existing := make([]relations.Link, 0, len(t.relationships))
+	for _, r := range t.relationships {
+		existing = append(existing, r)
+	}
+	present := map[string]bool{}
+	for _, m := range b.Memories {
+		present[m.ID] = true
+	}
+	links, jobs, err := store.PlanRelations(b, existing, func(id string) bool { return t.mems[id] != nil || present[id] }, now)
+	if err != nil {
 		return nil, err
 	}
 
@@ -98,6 +131,11 @@ func (s *Store) Write(_ context.Context, b *store.Batch) (*store.Receipt, error)
 		if c.ValidTo != nil {
 			v := *c.ValidTo
 			m.ValidTo = &v
+			at := now
+			if c.ClosedAt != nil {
+				at = *c.ClosedAt
+			}
+			m.ClosedAt = &at
 		}
 		if c.InvalidatedAt != nil {
 			v := *c.InvalidatedAt
@@ -139,7 +177,7 @@ func (s *Store) Write(_ context.Context, b *store.Batch) (*store.Receipt, error)
 		t.history[e.MemoryID] = append(t.history[e.MemoryID], e)
 	}
 
-	rec := &store.Receipt{}
+	rec := &store.Receipt{Result: append(json.RawMessage(nil), b.Result...), OperationHash: b.OperationHash}
 	for _, ep := range b.Episodes {
 		if ep.ClientMsgID != "" {
 			if id, ok := t.clientIDs[ep.Run+"\x00"+ep.ClientMsgID]; ok {
@@ -220,14 +258,34 @@ func (s *Store) Write(_ context.Context, b *store.Batch) (*store.Receipt, error)
 	for _, j := range b.Jobs {
 		s.enqueue(b.Tenant, j, now)
 	}
+	for _, j := range jobs {
+		s.enqueue(b.Tenant, j, now)
+	}
+	t.relationships = map[string]relations.Link{}
+	for _, r := range links {
+		t.relationships[r.ID] = cloneLink(r)
+	}
 	if b.Settings != nil {
 		t.settings = append([]byte(nil), b.Settings...)
+	}
+	for _, old := range t.operations {
+		store.RedactReceipt(old, b.Deletes)
+	}
+	store.RedactReceipt(rec, b.Deletes)
+	if b.OperationKey != "" {
+		t.operations[b.OperationKey] = cloneReceipt(rec)
 	}
 	return rec, nil
 }
 
 // check validates every conditional change of b without mutating anything.
 func (s *Store) check(t *tenant, b *store.Batch) error {
+	for _, c := range b.Checks {
+		m := t.mems[c.ID]
+		if m == nil || m.Version != c.Version || (c.Open && !store.Open(m)) {
+			return conflict("memory %s changed", c.ID)
+		}
+	}
 	closing := map[string]bool{}
 	for _, c := range b.Closes {
 		m := t.mems[c.ID]
@@ -241,11 +299,13 @@ func (s *Store) check(t *tenant, b *store.Batch) error {
 		deleting[id] = true
 	}
 	taken := map[string]bool{}
+	ids := map[string]bool{}
 	for i := range b.Memories {
 		m := &b.Memories[i]
-		if m.ID == "" || t.mems[m.ID] != nil {
+		if m.ID == "" || t.mems[m.ID] != nil || ids[m.ID] {
 			return fmt.Errorf("%w: memory id %q missing or already used", memory.ErrInvalid, m.ID)
 		}
+		ids[m.ID] = true
 		k := store.SlotKey(m)
 		if k == "" || !store.Open(m) {
 			continue
@@ -260,10 +320,61 @@ func (s *Store) check(t *tenant, b *store.Batch) error {
 			return fmt.Errorf("%w: bad vector for %s", memory.ErrInvalid, p.Target.Key())
 		}
 	}
+	cursors := map[string]int64{}
+	for run, r := range t.runs {
+		cursors[run] = r.ProcessedSeq
+	}
+	episodeIDs := map[string]bool{}
+	clientIDs := map[string]bool{}
+	for _, ep := range b.Episodes {
+		clientKey := ep.Run + "\x00" + ep.ClientMsgID
+		if ep.ClientMsgID != "" && (t.clientIDs[clientKey] != "" || clientIDs[clientKey]) {
+			continue
+		}
+		if ep.ID != "" && (t.episodes[ep.ID] != nil || episodeIDs[ep.ID]) {
+			return conflict("episode %s already exists", ep.ID)
+		}
+		if ep.ID != "" {
+			episodeIDs[ep.ID] = true
+		}
+		if ep.ClientMsgID != "" {
+			clientIDs[clientKey] = true
+		}
+		if _, ok := cursors[ep.Run]; !ok {
+			cursors[ep.Run] = 0
+		}
+	}
+	for _, run := range b.DeleteRuns {
+		delete(cursors, run)
+	}
 	for _, c := range b.Cursors {
-		r := t.runs[c.Run]
-		if r == nil || r.ProcessedSeq != c.From {
+		from, ok := cursors[c.Run]
+		if !ok || from != c.From {
 			return conflict("run %s cursor moved", c.Run)
+		}
+		cursors[c.Run] = c.To
+	}
+	pending := map[string]bool{}
+	jobIDs := map[string]bool{}
+	for id, j := range s.jobs {
+		jobIDs[id] = true
+		if j.Tenant == b.Tenant && j.State == store.JobPending && j.Key != "" {
+			pending[j.Kind+"\x00"+j.Key] = true
+		}
+	}
+	for _, j := range b.Jobs {
+		key := j.Kind + "\x00" + j.Key
+		if j.Key != "" && pending[key] {
+			continue
+		}
+		if j.ID != "" && jobIDs[j.ID] {
+			return conflict("job %s already exists", j.ID)
+		}
+		if j.ID != "" {
+			jobIDs[j.ID] = true
+		}
+		if j.Key != "" {
+			pending[key] = true
 		}
 	}
 	return nil
@@ -287,6 +398,11 @@ func (t *tenant) resolve(ref memory.EntityRef) *memory.Entity {
 }
 
 func (t *tenant) deleteMem(id string) {
+	for key, link := range t.relationships {
+		if link.Source == id || link.Target == id {
+			delete(t.relationships, key)
+		}
+	}
 	m := t.mems[id]
 	if m == nil {
 		return
@@ -905,7 +1021,7 @@ func (s *Store) Jobs(_ context.Context, q store.JobQuery) ([]store.Job, error) {
 	defer s.mu.RUnlock()
 	var out []store.Job
 	for _, j := range s.jobs {
-		if (q.Tenant == "" || j.Tenant == q.Tenant) && (q.State == "" || j.State == q.State) && (q.Kind == "" || j.Kind == q.Kind) {
+		if (q.Tenant == "" || j.Tenant == q.Tenant) && (q.State == "" || j.State == q.State) && (q.Kind == "" || j.Kind == q.Kind) && (q.Key == "" || j.Key == q.Key) {
 			out = append(out, *j)
 		}
 	}
@@ -926,7 +1042,7 @@ func cloneMem(m *memory.Memory) *memory.Memory {
 			c.Metadata[k] = v
 		}
 	}
-	for _, p := range []**time.Time{&c.ValidTo, &c.InvalidatedAt, &c.ExpiresAt} {
+	for _, p := range []**time.Time{&c.ValidTo, &c.InvalidatedAt, &c.ExpiresAt, &c.ClosedAt} {
 		if *p != nil {
 			v := **p
 			*p = &v

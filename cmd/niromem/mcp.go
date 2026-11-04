@@ -12,6 +12,7 @@ import (
 	niromem "github.com/alexedtionweb/niro-memory"
 	"github.com/alexedtionweb/niro-memory/api"
 	"github.com/alexedtionweb/niro-memory/client"
+	"github.com/alexedtionweb/niro-memory/knowledge"
 	"github.com/alexedtionweb/niro-memory/mcp"
 	"github.com/alexedtionweb/niro-memory/memory"
 	"github.com/alexedtionweb/niro-memory/pipeline"
@@ -22,6 +23,22 @@ type mcpBackend struct {
 	engine *niromem.Engine
 	tenant string
 	as     memory.Principal
+}
+
+func (b mcpBackend) EvaluateKnowledge(ctx context.Context, req niromem.KnowledgeRequest) (*niromem.KnowledgeResult, error) {
+	req.Input.Scope = memory.Scope{Tenant: b.tenant, User: b.as.User, Agent: b.as.Agent}
+	req.As, req.Input.Authority = b.as, false
+	return b.engine.EvaluateKnowledge(ctx, req)
+}
+
+func (b mcpBackend) KnowledgeState(ctx context.Context, req niromem.KnowledgeRequest) (knowledge.State, error) {
+	req.Input.Scope = memory.Scope{Tenant: b.tenant, User: b.as.User, Agent: b.as.Agent}
+	req.As, req.Input.Authority = b.as, false
+	return b.engine.KnowledgeState(ctx, req)
+}
+
+func (b mcpBackend) KnowledgeTrace(ctx context.Context, key string) (*niromem.KnowledgeResult, error) {
+	return b.engine.KnowledgeTrace(ctx, b.tenant, b.as, key)
 }
 
 func (b mcpBackend) Search(ctx context.Context, req client.SearchRequest) (*search.Result, error) {

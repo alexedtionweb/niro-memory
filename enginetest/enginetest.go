@@ -34,6 +34,9 @@ const testRules = `{"version":1,
 
 // Run executes the scenarios. Each gets a fresh store.
 func Run(t *testing.T, newStore Factory) {
+	t.Run("GroundedBackgroundEnrichment", func(t *testing.T) { testEnrichment(t, newStore) })
+	t.Run("KnowledgeIntelligence", func(t *testing.T) { testKnowledge(t, newStore) })
+	t.Run("DerivedRelationships", func(t *testing.T) { testRelationships(t, newStore) })
 	rs, err := rules.Parse([]byte(testRules))
 	if err != nil {
 		t.Fatal(err)

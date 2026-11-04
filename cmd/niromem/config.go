@@ -10,16 +10,19 @@ import (
 // Config is the server configuration file (JSON). ${VAR} references are
 // expanded from the environment before parsing, so secrets stay out of files.
 type Config struct {
+	knowledgeRuntime bool
 	// Env is "development" or "production". Production refuses the dev
 	// console and dev authentication.
 	Env    string `json:"env"`
 	Listen string `json:"listen"`
 
-	Store    Choice `json:"store"`
-	Vector   Choice `json:"vector"`
-	Blob     Choice `json:"blob"`
-	Cache    Choice `json:"cache"`
-	Embedder Choice `json:"embedder"`
+	Store         Choice          `json:"store"`
+	Vector        Choice          `json:"vector"`
+	Blob          Choice          `json:"blob"`
+	Cache         Choice          `json:"cache"`
+	Embedder      Choice          `json:"embedder"`
+	Relationships Choice          `json:"relationships"`
+	Knowledge     KnowledgeConfig `json:"knowledge"`
 
 	// Rules is a path to a rules file (see configs/rules.example.json).
 	Rules string `json:"rules"`
@@ -34,6 +37,23 @@ type Config struct {
 		Concurrency int  `json:"concurrency"`
 	} `json:"worker"`
 	DebounceMS int `json:"debounce_ms"`
+}
+
+type KnowledgeConfig struct {
+	BackgroundEnrichment bool   `json:"background_enrichment"`
+	Mode                 string `json:"mode"`
+	Planner              Choice `json:"planner"`
+	// Profiles are constructed only when the development console is enabled.
+	Profiles      map[string]Choice `json:"profiles,omitempty"`
+	MaxCandidates int               `json:"max_candidates"`
+	MaxGraphHops  int               `json:"max_graph_hops"`
+	TimeoutMS     int               `json:"timeout_ms"`
+	Fallback      bool              `json:"fallback"`
+	Consolidation bool              `json:"consolidation"`
+	Admission     struct {
+		Enabled      bool `json:"enabled"`
+		MaxTextBytes int  `json:"max_text_bytes"`
+	} `json:"admission"`
 }
 
 // KeyConf mirrors api.Key.
@@ -88,6 +108,11 @@ func (c Choice) Decode(v any) error {
 func loadConfig(path string) (*Config, error) {
 	cfg := &Config{Env: "development", Listen: "127.0.0.1:8080"}
 	cfg.Store.Use = "sqlite"
+	cfg.Knowledge.Mode = "disabled"
+	cfg.Knowledge.Planner.Use = "deterministic"
+	cfg.Knowledge.MaxCandidates = 50
+	cfg.Knowledge.MaxGraphHops = 3
+	cfg.Knowledge.TimeoutMS = 2000
 	if path == "" {
 		cfg.Auth.Dev = true
 		cfg.Worker.Inline = true
@@ -108,8 +133,55 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.Env == "production" && cfg.Auth.Dev {
 		return nil, fmt.Errorf("config: dev auth is not allowed in production")
 	}
+	if err := cfg.validateKnowledge(); err != nil {
+		return nil, err
+	}
 	if !cfg.Auth.Dev && len(cfg.Auth.Keys) == 0 {
 		return nil, fmt.Errorf("config: configure auth.keys (or auth.dev for local development)")
 	}
 	return cfg, nil
+}
+
+func (cfg *Config) validateKnowledge() error {
+	if cfg.Knowledge.Mode == "" {
+		cfg.Knowledge.Mode = "disabled"
+	}
+	switch cfg.Knowledge.Mode {
+	case "disabled", "shadow", "enforced":
+	default:
+		return fmt.Errorf("config: knowledge.mode must be disabled, shadow, or enforced")
+	}
+	if cfg.Knowledge.Planner.Use == "" {
+		cfg.Knowledge.Planner.Use = "deterministic"
+	}
+	switch cfg.Knowledge.Planner.Use {
+	case "deterministic", "openai", "ollama":
+	default:
+		return fmt.Errorf("config: knowledge.planner.use must be deterministic, openai, or ollama")
+	}
+	if cfg.Knowledge.MaxCandidates == 0 {
+		cfg.Knowledge.MaxCandidates = 50
+	}
+	if cfg.Knowledge.MaxCandidates < 1 || cfg.Knowledge.MaxCandidates > 1000 {
+		return fmt.Errorf("config: knowledge.max_candidates must be between 1 and 1000")
+	}
+	if cfg.Knowledge.MaxGraphHops == 0 {
+		cfg.Knowledge.MaxGraphHops = 3
+	}
+	if cfg.Knowledge.MaxGraphHops < 1 || cfg.Knowledge.MaxGraphHops > 4 {
+		return fmt.Errorf("config: knowledge.max_graph_hops must be between 1 and 4")
+	}
+	if cfg.Knowledge.TimeoutMS == 0 {
+		cfg.Knowledge.TimeoutMS = 2000
+	}
+	if cfg.Knowledge.TimeoutMS < 1 || cfg.Knowledge.TimeoutMS > 30000 {
+		return fmt.Errorf("config: knowledge.timeout_ms must be between 1 and 30000")
+	}
+	if cfg.Knowledge.Admission.MaxTextBytes < 0 || cfg.Knowledge.Admission.MaxTextBytes > 1<<20 {
+		return fmt.Errorf("config: knowledge.admission.max_text_bytes must be between 0 and 1048576")
+	}
+	if cfg.Knowledge.Admission.MaxTextBytes == 0 {
+		cfg.Knowledge.Admission.MaxTextBytes = 32768
+	}
+	return nil
 }

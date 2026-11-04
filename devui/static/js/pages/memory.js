@@ -1,6 +1,7 @@
 // Memory detail: content, provenance, the bi-temporal version timeline,
 // lifecycle history and actions (correct, invalidate, delete).
-import { call, h, page, table, short, status, badge, pre, date, guard, toast } from '../lib.js';
+import { state, call, h, page, table, short, status, badge, pre, date, guard, toast } from '../lib.js';
+import { inspectEnrichment, workspaceSession } from '../knowledge-ui.js';
 
 const NS = 'http://www.w3.org/2000/svg';
 const svg = (tag, attrs, ...kids) => {
@@ -34,6 +35,7 @@ function timeline(versions) {
 }
 
 export default async function (root, [id]) {
+  const active = workspaceSession(root);
   const m = await call('GET', '/v1/memories/' + id);
   const [{ versions }, { events }] = await Promise.all([
     call('GET', `/v1/memories/${id}/versions`), call('GET', `/v1/memories/${id}/history`)]);
@@ -51,7 +53,13 @@ export default async function (root, [id]) {
     await call('DELETE', '/v1/memories/' + id); toast('Deleted'); location.hash = '#/memories';
   });
   const src = m.source || {};
+  const enrichment = h('div');
+  if (!active()) return;
   page(root, m.title || 'Memory ' + short(m.id), null,
+    h('div', { class: 'row page-actions' }, h('a', { class: 'button-link', href: '#/explorer/' + m.id }, 'Explore relationships'), h('a', { class: 'button-link', href: '#/timeline' }, 'Open timeline'),
+      h('a', { href: '#/knowledge-state/' + encodeURIComponent(m.id) }, 'Inspect knowledge state'),
+      h('a', { href: '#/intelligence/' + encodeURIComponent(m.id) }, 'Propose transition')),
+    enrichment,
     h('div', { class: 'grid2' },
       h('div', { class: 'card' },
         h('p', null, status(m), badge(m.kind), badge('L' + m.layer), badge(m.visibility), badge('trust ' + src.trust, src.trust === 'low' ? 'warn' : ''),
@@ -60,7 +68,7 @@ export default async function (root, [id]) {
         h('div', { class: 'kv' },
           h('div', null, 'id'), h('div', { class: 'mono' }, m.id),
           h('div', null, 'owner'), h('div', null, [m.tenant, m.user_id, m.agent_id, m.run_id].filter(Boolean).join(' / ')),
-          h('div', null, 'relation'), h('div', null, [m.subject, m.predicate, m.object].filter(Boolean).join(' → ') || '—'),
+          h('div', null, 'relation'), h('div', null, [m.subject, (m.metadata?.assertion?.conditions?.polarity === 'negative' ? 'NOT ' : '') + (m.predicate || ''), m.object].filter(Boolean).join(' → ') || '—'),
           h('div', null, 'slot'), h('div', { class: 'mono' }, m.slot || '—'),
           h('div', null, 'valid'), h('div', null, date(m.valid_from), ' → ', m.valid_to ? date(m.valid_to) : 'open'),
           h('div', null, 'recorded'), h('div', null, date(m.recorded_at), m.invalidated_at ? ' · invalidated ' + date(m.invalidated_at) : ''),
@@ -91,4 +99,5 @@ export default async function (root, [id]) {
             { label: 'change', render: (e) => [e.old && h('div', { class: 'muted' }, '− ' + e.old), e.new && h('div', null, '+ ' + e.new)] },
             { label: 'by', key: 'actor' }, { label: 'reason', key: 'reason' },
           ], events)))));
+  if (state.info?.capabilities?.background_enrichment) await inspectEnrichment(enrichment, id);
 }

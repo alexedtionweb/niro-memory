@@ -1,0 +1,32 @@
+{
+  "env": "development",
+  "listen": "127.0.0.1:8080",
+  "store": {
+    "use": "sqlite",
+    "sqlite": {
+      "path": "niromem.db"
+    }
+  },
+  "auth": {
+    "dev": true
+  },
+  "worker": {
+    "inline": true,
+    "concurrency": 2
+  },
+  "knowledge": {
+    "mode": "disabled",
+    "planner": {
+      "use": "deterministic"
+    },
+    "max_candidates": 50,
+    "max_graph_hops": 3,
+    "timeout_ms": 2000,
+    "fallback": false,
+    "consolidation": false,
+    "admission": {
+      "enabled": false,
+      "max_text_bytes": 32768
+    }
+  }
+}

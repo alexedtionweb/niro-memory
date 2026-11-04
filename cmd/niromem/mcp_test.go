@@ -17,8 +17,101 @@ import (
 	niromem "github.com/alexedtionweb/niro-memory"
 	"github.com/alexedtionweb/niro-memory/api"
 	"github.com/alexedtionweb/niro-memory/devui"
+	"github.com/alexedtionweb/niro-memory/knowledge"
+	"github.com/alexedtionweb/niro-memory/memory"
 	"github.com/alexedtionweb/niro-memory/store/memstore"
 )
+
+func TestMCPKnowledgeInspectionAndProposal(t *testing.T) {
+	ctx := context.Background()
+	engine, err := niromem.Open(niromem.Options{
+		Store: memstore.New(nil),
+		Knowledge: niromem.KnowledgeOptions{
+			Mode: "enforced", Planner: knowledge.Deterministic{},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	for _, scope := range []memory.Scope{
+		{Tenant: "one", User: "project", Agent: "claude-code"},
+		{Tenant: "one", User: "another-project", Agent: "claude-code"},
+		{Tenant: "two", User: "project", Agent: "claude-code"},
+	} {
+		_, err := engine.Remember(ctx, niromem.Fact{
+			Scope: scope, Text: scope.Tenant + "/" + scope.User + " test command",
+			Slot: "project.test_command",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	const key = "integrated-knowledge-mcp-key-012345"
+	auth, err := api.NewKeys([]api.Key{{Key: key, Tenant: "one", Admin: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := mcpHandler(engine, auth, "localhost:8080", "project", "claude-code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := func(body string) json.RawMessage {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "http://localhost:8080/mcp", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+key)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		res := httptest.NewRecorder()
+		handler.ServeHTTP(res, req)
+		var rpc struct {
+			Result json.RawMessage `json:"result"`
+			Error  json.RawMessage `json:"error"`
+		}
+		if res.Code != http.StatusOK || json.Unmarshal(res.Body.Bytes(), &rpc) != nil || len(rpc.Error) != 0 {
+			t.Fatalf("MCP response: %d %s", res.Code, res.Body.String())
+		}
+		return rpc.Result
+	}
+	list := call(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	for _, name := range []string{"inspect_knowledge", "explain_memory", "propose_memory_update"} {
+		if !strings.Contains(string(list), name) {
+			t.Fatalf("missing optional tool %s: %s", name, list)
+		}
+	}
+	toolText := func(raw json.RawMessage, wantError bool) string {
+		t.Helper()
+		var result struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+			IsError bool `json:"isError"`
+		}
+		if err := json.Unmarshal(raw, &result); err != nil || result.IsError != wantError || len(result.Content) != 1 {
+			t.Fatalf("tool result: %s %v", raw, err)
+		}
+		return result.Content[0].Text
+	}
+	inspection := toolText(call(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"inspect_knowledge","arguments":{"slot":"project.test_command"}}}`), false)
+	if !strings.Contains(inspection, "one/project test command") ||
+		strings.Contains(inspection, "another-project") || strings.Contains(inspection, "two/project") {
+		t.Fatalf("integrated inspection leaked scope: %s", inspection)
+	}
+	proposal := toolText(call(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"propose_memory_update","arguments":{"operation_key":"integrated-dry-run","text":"Use go test ./...","slot":"project.proposed_command"}}}`), false)
+	var result niromem.KnowledgeResult
+	if err := json.Unmarshal([]byte(proposal), &result); err != nil || result.Status != "proposed" ||
+		result.Scope != (memory.Scope{Tenant: "one", User: "project", Agent: "claude-code"}) {
+		t.Fatalf("proposal scope/result: %s %v", proposal, err)
+	}
+	toolText(call(`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"inspect_knowledge","arguments":{"slot":"project.test_command","user_id":"another-project"}}}`), true)
+	memories, err := engine.List(ctx, niromem.ListRequest{Tenant: "one", User: "project", Agent: "claude-code"})
+	if err != nil || len(memories) != 1 || memories[0].Slot != "project.test_command" {
+		t.Fatalf("dry-run changed persistent memories: %+v %v", memories, err)
+	}
+	if _, err := engine.KnowledgeTrace(ctx, "one", memory.Principal{Admin: true}, "integrated-dry-run"); err == nil {
+		t.Fatal("dry-run wrote a committed trace")
+	}
+}
 
 func TestMCPAuthAndGuards(t *testing.T) {
 	e, err := niromem.Open(niromem.Options{Store: memstore.New(nil)})

@@ -19,7 +19,7 @@ var columns = map[string]string{
 	"derived_by": "m.derived_by", "supersedes": "m.supersedes", "layer": "m.layer",
 	"confidence": "m.confidence", "importance": "m.importance", "heat": "m.heat", "version": "m.version",
 	"valid_from": "m.valid_from", "valid_to": "m.valid_to", "recorded_at": "m.recorded_at",
-	"invalidated_at": "m.invalidated_at", "expires_at": "m.expires_at",
+	"invalidated_at": "m.invalidated_at", "expires_at": "m.expires_at", "closed_at": "m.closed_at",
 }
 
 func (dialect) Param(n int) string          { return "$" + strconv.Itoa(n) }

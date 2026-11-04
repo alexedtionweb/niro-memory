@@ -31,6 +31,7 @@ func Handler(o Options) http.Handler {
 	mux.Handle("GET /_dev/", http.StripPrefix("/_dev/", http.FileServerFS(sub)))
 	d := &dev{o}
 	d.route(mux, "GET /_dev/api/info", d.info)
+	d.route(mux, "GET /_dev/api/knowledge/config", d.knowledgeConfig)
 	d.route(mux, "GET /_dev/api/tenants", d.tenants)
 	d.route(mux, "GET /_dev/api/runs", d.runs)
 	d.route(mux, "POST /_dev/api/sql", d.sql)
@@ -41,6 +42,10 @@ func Handler(o Options) http.Handler {
 	d.route(mux, "GET /_dev/api/rules", d.rulesDoc)
 	d.route(mux, "POST /_dev/api/rules/test", d.rulesTest)
 	return securityHeaders(mux)
+}
+
+func (d *dev) knowledgeConfig(w http.ResponseWriter, r *http.Request, id api.Identity) (any, error) {
+	return d.o.Engine.KnowledgeConfiguration(r.Context(), id.Tenant)
 }
 
 // securityHeaders keeps the console from being framed or loading remote code.
@@ -91,7 +96,13 @@ func (d *dev) info(w http.ResponseWriter, r *http.Request, id api.Identity) (any
 		return nil, err
 	}
 	_, sqlOK := d.o.Engine.Store().(store.SQLConsole)
-	return map[string]any{"tenant": id.Tenant, "capabilities": d.o.Engine.Capabilities(), "policies": pol,
+	knowledge, err := d.o.Engine.KnowledgeConfiguration(r.Context(), id.Tenant)
+	if err != nil {
+		return nil, err
+	}
+	capabilities := d.o.Engine.Capabilities()
+	capabilities.KnowledgeMode = knowledge.Effective.Mode
+	return map[string]any{"tenant": id.Tenant, "capabilities": capabilities, "knowledge": knowledge, "policies": pol,
 		"sql": sqlOK, "metrics": d.o.Metrics != nil}, nil
 }
 
