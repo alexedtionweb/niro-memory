@@ -29,8 +29,8 @@ func main() {
 		baseURL = "http://127.0.0.1:8080"
 	}
 	c := client.New(baseURL, os.Getenv("NIROMEM_API_KEY"))
-	c.HTTP.Timeout = 5 * time.Second
-	s, err := mcp.New(c, os.Getenv("NIROMEM_USER_ID"), os.Getenv("NIROMEM_AGENT_ID"))
+	c.HTTP.Timeout = mcp.SearchTimeout + 5*time.Second
+	s, err := mcp.NewWorkspace(c, os.Getenv("NIROMEM_USER_ID"), os.Getenv("NIROMEM_AGENT_ID"))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func serveHTTP(s *mcp.Server, address, backend, token string) error {
 	}
 	srv := &http.Server{
 		Handler: s.HTTPHandler(port, token), ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second,
+		ReadTimeout: 10 * time.Second, WriteTimeout: mcp.SearchTimeout + 10*time.Second, IdleTimeout: 60 * time.Second,
 	}
 	log.Printf("MCP adapter at http://%s/mcp; memory API at %s", listener.Addr(), backend)
 	if token == "" {

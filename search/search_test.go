@@ -175,8 +175,10 @@ func TestVectorAndBudget(t *testing.T) {
 	// A slow embedder is skipped within budget, and warms the cache in the background.
 	slow := slowEmbedder{Hash: emb, delay: 120 * time.Millisecond}
 	sr = &search.Searcher{Store: s, Index: s, Embedder: slow, Cache: c}
+	bounded := search.Default["default"]
+	bounded.EmbedBudget = 50 * time.Millisecond
 	start := time.Now()
-	r, _ = sr.Search(ctx, search.Request{Tenant: "t", User: "u", Text: "slow query about cats", Model: emb.Model().ID})
+	r, _ = sr.Search(ctx, search.Request{Tenant: "t", User: "u", Text: "slow query about cats", Model: emb.Model().ID, Policy: bounded})
 	if time.Since(start) > 100*time.Millisecond || strategies(r)["vector"].Ran || !strings.Contains(strategies(r)["vector"].Reason, "budget") {
 		t.Fatalf("budget not enforced: %v %+v", time.Since(start), strategies(r)["vector"])
 	}

@@ -2,16 +2,21 @@
 // tenant settings document (rules override, vector models, bindings,
 // retrieval policies).
 import { state, call, h, page, table, pre, guard, toast } from '../lib.js';
+import { workspaceSession } from '../knowledge-ui.js';
 
 export default async function (root) {
+  const active = workspaceSession(root);
   const tenants = await call('GET', '/_dev/api/tenants');
+  if (!active()) return;
   const settings = await call('GET', '/v1/settings');
+  if (!active()) return;
   const editor = h('textarea', { rows: 18 });
   editor.value = JSON.stringify(settings, null, 2);
   const save = guard(async () => {
+    if (!active()) return;
     const doc = JSON.parse(editor.value);
     await call('PUT', '/v1/settings', doc);
-    toast('Settings saved');
+    if (active()) { toast('Settings saved'); window.dispatchEvent(new Event('niromem:config')); }
   });
   const example = {
     vector_models: [{ id: 'openai/text-embedding-3-small@1', dims: 1536, modalities: ['text'], active: true }],

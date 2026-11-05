@@ -1,110 +1,113 @@
-// Console shell: navigation, connection settings and a hash router.
-import { state, call, h, toast } from './lib.js';
+import { state, call, h, toast, requestHeaders } from './lib.js';
+import { screens, resolveRoute } from './routes.js';
 
-const pages = [
-  ['Workspace', [
-    ['explorer', 'Memories'],
-    ['intelligence', 'Try a memory'],
-    ['knowledge-state', 'What is known?'],
-    ['timeline', 'Timeline'],
-    ['transitions', 'Saved result'],
-  ]],
-  ['Data', [
-    ['tenants', 'Tenants & settings'],
-    ['memories', 'Memory browser'],
-    ['conversations', 'Conversations'],
-    ['sql', 'SQL console'],
-  ]],
-  ['Retrieval', [
-    ['search', 'Search playground'],
-    ['embeddings', 'Embeddings'],
-    ['graph', 'Entity graph'],
-  ]],
-  ['Processing', [
-    ['rules', 'Rules'],
-    ['add', 'Add playground'],
-    ['jobs', 'Jobs'],
-    ['metrics', 'Metrics'],
-  ]],
-];
+const main = document.getElementById('main');
+let generation = 0, infoGeneration = 0;
+const requests = new WeakMap();
+const active = (context) => context && context.generation === generation &&
+  context.tenant === state.tenant && context.key === state.key;
 
-function nav() {
-  const current = location.hash.slice(2).split(/[/?]/)[0] || 'explorer';
-  const sections = pages.map(([group, items]) => [
-    h('div', { class: 'group' }, group),
-    ...items.map(([id, label]) => h('a', { href: '#/' + id, class: current === id ? 'active' : '' }, label)),
-  ]);
-  document.getElementById('nav').replaceChildren(...sections[0],
-    h('details', { class: 'advanced-nav', open: pages.slice(1).some(([, items]) => items.some(([id]) => id === current)) },
-      h('summary', null, 'Developer tools'), ...sections.slice(1).flat()));
+function nav(screen) {
+  document.getElementById('nav').replaceChildren(...screens.map(s =>
+    h('a', { href: '#/' + s.id, class: screen === s.id ? 'active' : '',
+      'aria-current': screen === s.id ? 'page' : null }, s.label)));
 }
 
-let infoGeneration = 0;
 async function refreshInfo() {
-  const generation = ++infoGeneration, tenant = state.tenant, key = state.key;
-  const active = () => generation === infoGeneration && state.tenant === tenant && state.key === key;
+  const revision = ++infoGeneration, tenant = state.tenant, key = state.key;
   try {
     const info = await call('GET', '/_dev/api/info');
-    if (!active()) return;
+    if (revision !== infoGeneration || tenant !== state.tenant || key !== state.key) return;
     state.info = info;
-    const c = state.info.capabilities;
     document.getElementById('caps').textContent =
-      `Connected · ${info.knowledge?.effective?.model || info.knowledge?.effective?.provider || 'Memory engine'} · ` +
-      ((info.knowledge?.effective?.background_enrichment
-        ? { disabled: 'Extraction paused — saves enabled', shadow: 'Test extraction — originals saved', enforced: 'Live background extraction' }
-        : { disabled: 'Analysis paused', shadow: 'Test mode — memories unchanged', enforced: 'Live mode — confirmed changes allowed' })[c.knowledge_mode] || 'Mode unavailable');
+      `Connected · ${info.knowledge?.effective?.model || 'Memory engine'} · ${info.capabilities?.knowledge_mode || 'disabled'}`;
   } catch (e) {
-    if (!active()) return;
+    if (revision !== infoGeneration || tenant !== state.tenant || key !== state.key) return;
     state.info = null;
-    document.getElementById('caps').textContent = 'not connected: ' + e.message;
+    document.getElementById('caps').textContent = 'Not connected: ' + e.message;
+    document.querySelector('.connection-settings').open = true;
   }
 }
 
-let routeGeneration = 0;
-async function route() {
-  const generation = ++routeGeneration, tenant = state.tenant, key = state.key;
-  nav();
-  document.getElementById('tenant').value = state.tenant;
-  const [name, ...params] = location.hash.slice(2).split('?')[0].split('/');
-  const id = name || 'explorer';
-  const main = document.getElementById('main');
-  main.replaceChildren(h('p', { class: 'muted' }, 'Loading…'));
+function failure(message) {
+  main.removeAttribute('aria-busy');
+  main.replaceChildren(h('section', { class: 'card', role: 'alert' },
+    h('h1', null, 'Unable to open workspace'), h('p', { class: 'error-message' }, message),
+    h('button', { onclick: route }, 'Retry')));
+}
+
+async function mount(context) {
+  if (!active(context)) return;
+  const root = main.querySelector('#workspace-content');
+  if (!root) { failure('The server returned an invalid workspace fragment.'); return; }
   try {
-    const mod = await import('./pages/' + (id === 'memory' ? 'memory' : id) + '.js');
-    if (generation !== routeGeneration || state.tenant !== tenant || state.key !== key) return;
-    const content = h('div');
-    main.replaceChildren(content);
-    await mod.default(content, params.map(decodeURIComponent));
+    const mod = await import('./pages/' + context.route.view + '.js');
+    if (!active(context)) return;
+    await mod.default(root, context.route.params);
+    if (active(context)) main.focus({ preventScroll: true });
   } catch (e) {
-    if (generation === routeGeneration && state.tenant === tenant && state.key === key)
-      main.replaceChildren(h('h1', null, 'Error'), h('pre', null, e.stack || e.message));
+    if (active(context)) root.replaceChildren(h('p', { class: 'error-message', role: 'alert' }, e.message));
   }
 }
 
-function connection() {
-  const t = document.getElementById('tenant');
-  const k = document.getElementById('key');
-  t.value = state.tenant;
-  k.value = state.key;
-  const apply = async () => {
-    state.tenant = t.value.trim() || 'dev';
-    state.key = k.value.trim();
-    document.getElementById('main').replaceChildren(h('p', { class: 'muted' }, 'Connecting…'));
-    await refreshInfo();
-    route();
+async function route() {
+  const revision = ++generation;
+  let target;
+  try { target = resolveRoute(location.hash); } catch (e) { nav(''); failure(e.message); return; }
+  history.replaceState(null, '', target.hash);
+  nav(target.screen);
+  document.getElementById('tenant').value = state.tenant;
+  const context = { generation: revision, tenant: state.tenant, key: state.key, route: target };
+  main.replaceChildren(h('p', { class: 'muted', role: 'status' }, 'Loading workspace…'));
+  main.setAttribute('aria-busy', 'true');
+  // Independent sources keep rapid navigation out of HTMX's per-element queue.
+  const source = h('span', { hidden: true });
+  main.append(source);
+  const before = (event) => {
+    requests.set(event.detail.xhr, context);
   };
-  t.addEventListener('change', apply);
-  k.addEventListener('change', apply);
+  source.addEventListener('htmx:beforeRequest', before);
+  try {
+    await window.htmx.ajax('GET', target.path, {
+      source, target: main, swap: 'innerHTML', headers: requestHeaders(false),
+    });
+  } catch (e) {
+    if (active(context) && !context.failed) failure('Connection failed. Check that the server is running and retry.');
+  } finally {
+    source.removeEventListener('htmx:beforeRequest', before);
+    source.remove();
+    if (active(context)) main.removeAttribute('aria-busy');
+  }
 }
 
+main.addEventListener('htmx:beforeSwap', event => {
+  const context = requests.get(event.detail.xhr);
+  if (!active(context)) { event.detail.shouldSwap = false; return; }
+  if (event.detail.isError) {
+    context.failed = true;
+    failure(event.detail.xhr.status === 401 || event.detail.xhr.status === 403
+      ? 'An admin identity is required. Check the API key in Connection settings.'
+      : `Workspace request failed (HTTP ${event.detail.xhr.status}).`);
+    event.detail.shouldSwap = false;
+  }
+});
+main.addEventListener('htmx:afterSwap', event => { mount(requests.get(event.detail.xhr)); });
+
+async function connect() {
+  ++generation;
+  main.replaceChildren(h('p', { role: 'status' }, 'Connecting…'));
+  await refreshInfo();
+  await route();
+}
+
+const tenant = document.getElementById('tenant'), key = document.getElementById('key');
+tenant.value = state.tenant; key.value = state.key;
+for (const input of [tenant, key]) input.addEventListener('change', () => {
+  state.tenant = tenant.value.trim() || 'dev'; state.key = key.value.trim(); connect();
+});
 window.addEventListener('hashchange', route);
 window.addEventListener('niromem:config', refreshInfo);
-window.addEventListener('niromem:tenant', async () => {
-  document.getElementById('main').replaceChildren(h('p', { class: 'muted' }, 'Connecting…'));
-  document.getElementById('tenant').value = state.tenant;
-  await refreshInfo();
-  toast('Switched to tenant ' + state.tenant);
-  route();
+window.addEventListener('niromem:tenant', () => {
+  tenant.value = state.tenant; toast('Switched to tenant ' + state.tenant); connect();
 });
-connection();
 refreshInfo().then(route);

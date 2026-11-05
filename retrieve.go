@@ -49,6 +49,9 @@ func (e *Engine) Search(ctx context.Context, r SearchRequest) (res *search.Resul
 		return nil, err
 	}
 	_, active := e.models(s)
+	if len(r.IDs) == 0 {
+		r.Filter = memory.And(r.Filter, memory.Cmp("source", memory.OpNe, "document_manifest"))
+	}
 	as := r.As
 	if as.User == "" && as.Agent == "" && len(as.Roles) == 0 && !as.Admin {
 		as = memory.Principal{User: r.User, Agent: r.Agent}
@@ -176,7 +179,7 @@ func (e *Engine) Context(ctx context.Context, r ContextRequest) (out *Context, e
 			return nil, err
 		}
 	}
-	out = &Context{Window: window}
+	out = &Context{Window: window, Profile: []memory.Memory{}, Scenes: []SceneRef{}, Facts: []search.Hit{}, Skills: []memory.Memory{}}
 	items, chars := 0, 0
 	fits := func(text string) bool {
 		if items >= r.MaxItems || chars+len(text) > r.MaxChars {
@@ -340,7 +343,7 @@ func (e *Engine) Neighbors(ctx context.Context, tenant string, as memory.Princip
 	if err != nil {
 		return nil, err
 	}
-	n := &Neighborhood{Entity: found[0]}
+	n := &Neighborhood{Entity: found[0], Memories: []memory.Memory{}, Related: []Related{}}
 	counts := map[string]*Related{}
 	now := e.o.Now()
 	for i := range ms {

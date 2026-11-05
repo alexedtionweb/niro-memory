@@ -1,7 +1,8 @@
 import { state, call, h, page, pre, badge } from '../lib.js';
 import { statePath, scopedInput, renderState, renderTransition, renderSystems, workspaceSession, inspectEnrichment } from '../knowledge-ui.js';
+import { documentImport } from '../document-import.js';
 
-export default async function(root, [id]) {
+export default async function(root, [id], { settingsOnly = false } = {}) {
   root.setAttribute('class', 'knowledge-workspace');
   const active = workspaceSession(root);
   const [config, seed] = await Promise.all([
@@ -46,7 +47,7 @@ export default async function(root, [id]) {
   const evaluate = h('button', { class: 'primary', onclick: preview, 'data-action': 'preview' }, 'See what happens');
   const commit = h('button', { class: 'primary', disabled: true, onclick: persist, 'data-action': 'commit' });
   const fresh = h('button', { onclick: newOperation, 'data-action': 'reset' }, 'Start over');
-  let sourcePayload = '';
+  let sourcePayload = '', sourceSaved = false;
   const quickSave = h('button', { class: 'primary', 'data-action': 'save-now', onclick: saveNow }, 'Save now');
   const fast = config.effective.background_enrichment && !id;
   const keepView = h('section', { class: 'card' }, h('h2', null, 'Keep this result?'),
@@ -59,8 +60,8 @@ export default async function(root, [id]) {
   }
   function controls() {
     evaluate.disabled = busy || currentConfig.effective.mode === 'disabled' || !!commitPayload || !!sourcePayload;
-    quickSave.disabled = busy || !!commitPayload || useJSON.checked;
-    quickSave.textContent = sourcePayload ? 'Retry / retrieve saved memory' : 'Save now';
+    quickSave.disabled = busy || sourceSaved || !!commitPayload || useJSON.checked;
+    quickSave.textContent = sourceSaved ? 'Saved' : sourcePayload ? 'Retry / retrieve saved memory' : busy ? 'Saving original…' : 'Save now';
     commit.disabled = busy || !previewPayload || !confirmation.checked || currentConfig.effective.mode === 'disabled';
     fresh.disabled = busy;
     text.disabled = project.disabled = !!commitPayload || !!sourcePayload || busy || useJSON.checked;
@@ -78,6 +79,7 @@ export default async function(root, [id]) {
     commit.textContent = commitPayload ? 'Retry / retrieve this result' : mode === 'shadow' ? 'Record test result' : 'Save to memory';
     step.textContent = busy ? 'Working with the backend — this may take a few seconds.'
       : commitPayload ? '3 · Result — your exact input is locked so a retry cannot create a duplicate.'
+        : sourceSaved ? 'Original saved. Extraction runs in the background. Choose Start over to remember another memory.'
         : sourcePayload ? 'Original save attempted — input locked for safe retries; see the result below.'
         : previewPayload ? '2 · Review the suggestion — nothing has been saved yet.'
           : fast ? 'Save immediately. Extraction runs in the background.' : '1 · Write a memory, then see what the model suggests.';
@@ -94,7 +96,7 @@ export default async function(root, [id]) {
     controls();
   }
   function newOperation() {
-    commitPayload = ''; sourcePayload = ''; previewPayload = ''; key.value = crypto.randomUUID();
+    commitPayload = ''; sourcePayload = ''; sourceSaved = false; previewPayload = ''; key.value = crypto.randomUUID();
     confirmation.checked = false; error.textContent = '';
     resultView.replaceChildren(); beforeView.replaceChildren(); afterView.replaceChildren(); controls();
   }
@@ -137,9 +139,10 @@ export default async function(root, [id]) {
       if (!change?.memory?.id || !['add', 'supersede', 'evidence'].includes(change.action))
         throw new Error(change?.reason || 'Backend did not confirm a saved memory.');
       const progress = h('div');
+      sourceSaved = true;
       resultView.replaceChildren(h('h2', null, 'Original saved'), h('a', { href: '#/memory/' + encodeURIComponent(change.memory.id) }, 'Read original memory'), progress);
-      await inspectEnrichment(progress, change.memory.id);
-      if (active()) await refreshSystems();
+      void inspectEnrichment(progress, change.memory.id);
+      void refreshSystems();
     } catch (e) {
       if (active()) error.textContent = 'Save not confirmed: ' + e.message + '. Retry with the same key; do not assume nothing was saved.';
     } finally { busy = false; if (active()) controls(); }
@@ -186,6 +189,17 @@ export default async function(root, [id]) {
   const hops = h('input', { type: 'number', min: 0, max: config.server.max_graph_hops,
     value: config.policy?.max_graph_hops || 0, 'aria-label': 'Maximum graph hops' });
   const configStatus = h('p', { role: 'status' }), configView = h('div', null, pre(config));
+  const profileSummary = h('p');
+  function updateProfileSummary(value) {
+    profileSummary.replaceChildren(badge(value.effective.model || value.effective.provider), badge(value.effective.mode),
+      ...(value.effective.extraction?.entity_types || []).map(type => badge(type)));
+  }
+  updateProfileSummary(config);
+  const inheritExtraction = h('input', { type: 'checkbox', checked: !config.policy?.extraction, 'aria-label': 'Use server extraction defaults' });
+  const extraction = h('textarea', { rows: 16, 'aria-label': 'Extraction profile JSON', spellcheck: 'false',
+    value: JSON.stringify(config.policy?.extraction || config.effective.extraction || {}, null, 2), disabled: inheritExtraction.checked });
+  const schemaView = h('div', null, config.effective.extraction_schema ? pre(config.effective.extraction_schema) : 'Schema not reported by this server.');
+  inheritExtraction.addEventListener('change', () => { extraction.disabled = inheritExtraction.checked; });
   const save = h('button', { onclick: async () => {
     if (!active() || busy) return;
     if (commitPayload || sourcePayload) { configStatus.textContent = 'Start a new operation before changing configuration. Keep the existing key for any unconfirmed commit retry.'; return; }
@@ -194,13 +208,17 @@ export default async function(root, [id]) {
       if (!Number.isInteger(Number(cap.value)) || !Number.isInteger(Number(hops.value))) throw new Error('Limits must be integers.');
       const settings = await call('GET', '/v1/settings');
       if (!active()) return;
-      settings.knowledge = { mode: mode.value, planner: planner.value,
+      settings.knowledge = { ...settings.knowledge, mode: mode.value, planner: planner.value,
         max_candidates: Number(cap.value), max_graph_hops: Number(hops.value) };
+      if (inheritExtraction.checked) delete settings.knowledge.extraction;
+      else settings.knowledge.extraction = JSON.parse(extraction.value);
       await call('PUT', '/v1/settings', settings);
       if (!active()) return;
       const value = await call('GET', '/_dev/api/knowledge/config');
       if (!active()) return;
       currentConfig = value; configView.replaceChildren(pre(value));
+      updateProfileSummary(value);
+      schemaView.replaceChildren(value.effective.extraction_schema ? pre(value.effective.extraction_schema) : 'Schema not reported by this server.');
       if (state.info) {
         state.info.capabilities.knowledge_mode = value.effective.mode;
         state.info.knowledge = value;
@@ -216,6 +234,20 @@ export default async function(root, [id]) {
     } finally { busy = false; if (active()) controls(); }
   } }, 'Save tenant intelligence configuration');
 
+  if (settingsOnly) {
+    page(root, 'Extraction schema', 'The effective tenant profile and the exact JSON Schema sent to the model. Changes affect future extraction jobs; saved plans retain their original schema.',
+      h('section', { class: 'card' }, h('h2', null, 'Active extraction profile'),
+        profileSummary,
+        h('div', { class: 'row' }, h('label', null, 'Mode', mode), h('label', null, 'Model profile', planner),
+          h('label', null, 'Candidates', cap), h('label', null, 'Graph hops', hops))),
+      h('section', { class: 'card' }, h('h2', null, 'Entity types & optional attributes'),
+        h('label', { class: 'check' }, inheritExtraction, 'Use server extraction defaults'), extraction,
+        save, configStatus),
+      h('section', { class: 'card' }, h('h2', null, 'Effective JSON Schema'), schemaView),
+      h('details', { class: 'card' }, h('summary', null, 'Configuration diagnostics'), configView));
+    controls();
+    return;
+  }
   page(root, 'Try a memory', fast ? 'Save the original now. See extracted knowledge and connections appear below.' : 'Write something, review the suggestion, then decide whether to keep the result. Nothing is saved automatically.',
     h('div', { class: 'card mode-banner' }, modeNotice),
     h('div', { class: 'card' }, systems,
@@ -226,8 +258,11 @@ export default async function(root, [id]) {
       h('p', { class: 'muted' }, id ? 'This starts a correction of the memory you selected. The original stays in its history.'
         : fast ? 'Use everyday language. Saving does not wait for a model. Extraction is bounded to four claims per source.'
           : 'Use everyday language. The model suggests an action; the backend checks whether it is allowed.'),
-      fast ? quickSave : null, fast ? h('details', null, h('summary', null, 'Advanced: preview a transition instead'), evaluate) : evaluate, fresh),
+      h('div', { class: 'row' }, fast ? quickSave : evaluate, fresh),
+      fast ? h('details', null, h('summary', null, 'Advanced: preview a transition instead'), evaluate) : null),
     error, resultView,
+    !id ? documentImport(root, project) : null,
+    !id ? documentImport(root, project, { media: true }) : null,
     keepView,
     h('details', { class: 'card' }, h('summary', null, 'Compare memories before & after'), beforeView, afterView,
       h('p', { class: 'muted' }, 'These are bounded, session-only snapshots. Other writers can change state between reads.')),
@@ -243,6 +278,12 @@ export default async function(root, [id]) {
       h('p', { class: 'muted' }, 'Provider profiles are installed/configured by the server, not browser code. Credentials and endpoints are never returned here. Register additional knowledge.profiles in the CLI config to switch between Ollama and OpenAI-compatible models. 0 limits inherit server bounds.'),
       h('div', { class: 'row' }, h('label', null, 'Mode', mode), h('label', null, 'Provider profile', planner),
         h('label', null, 'Candidates', cap), h('label', null, 'Graph hops', hops), save), configStatus,
+      h('details', null, h('summary', null, 'Extraction: entity types, attributes & JSON Schema'),
+        h('p', null, 'Strong defaults extract named entities and grounded claims. Customize allowed entity types, fact types and optional entity_attributes (string, number or boolean; string enums supported). Safety and evidence fields cannot be removed.'),
+        h('label', { class: 'check' }, inheritExtraction, 'Use server extraction defaults'),
+        h('label', null, 'Controlled extraction profile (JSON)', extraction),
+        h('p', { class: 'muted' }, 'Save using the configuration button above. Changes affect new extraction plans; retries keep the original profile. Entity attributes are unreviewed model annotations, not verified facts.'),
+        h('details', null, h('summary', null, 'Effective provider output JSON Schema'), schemaView)),
       h('details', null, h('summary', null, 'Raw configuration'), configView)));
   controls();
   await refreshSystems();

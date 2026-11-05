@@ -89,6 +89,11 @@ type Index interface {
 	Search(ctx context.Context, q Query) ([]Hit, error)
 }
 
+// TenantPurger removes all points of one tenant without enumerating targets.
+type TenantPurger interface {
+	PurgeTenant(context.Context, string) error
+}
+
 // ErrDims is returned when a vector does not match its model's dimensions.
 var ErrDims = errors.New("vector: dimension mismatch")
 

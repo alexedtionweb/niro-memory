@@ -3,6 +3,7 @@ package niromem_test
 import (
 	"context"
 	"errors"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
@@ -15,13 +16,121 @@ import (
 	"github.com/alexedtionweb/niro-memory/store/memstore"
 )
 
-type extractionFixture struct {
-	calls int
-	input knowledge.EnrichmentInput
-	fail  error
-	after func(context.Context, knowledge.EnrichmentInput) error
+func TestBackgroundEnrichmentKeepsValidRecordsFromMalformedProviderOutput(t *testing.T) {
+	ctx := context.Background()
+	s := memstore.New(nil)
+	p := &extractionFixture{output: &knowledge.Enrichment{
+		Facts: []knowledge.ExtractedFact{
+			{Quote: "Atlas uses Redis.", Subject: "Atlas", Predicate: "uses", Object: "Redis", Type: memory.EpistemicFact},
+			{Quote: "Atlas uses Redis.", Subject: "Atlas", Predicate: "uses", Object: "invented database", Type: memory.EpistemicFact},
+		},
+		Entities:  []knowledge.ExtractedEntity{{Name: "", Type: "person", Quote: "Atlas uses Redis."}},
+		Relations: []knowledge.ExtractedRelation{},
+	}}
+	e, err := niromem.Open(niromem.Options{Store: s, Knowledge: niromem.KnowledgeOptions{Mode: "enforced", Planner: p, BackgroundEnrichment: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	changes, err := e.Remember(ctx, niromem.Fact{Scope: memory.Scope{Tenant: "t", User: "u"}, Text: "Atlas uses Redis."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	js, err := s.Jobs(ctx, store.JobQuery{Tenant: "t", Kind: niromem.JobKnowledgeEnrich})
+	if err != nil || len(js) != 1 {
+		t.Fatalf("jobs: %+v %v", js, err)
+	}
+	for range 2 {
+		if err := e.Worker().Handlers[niromem.JobKnowledgeEnrich](ctx, js[0]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := e.EnrichmentStatus(ctx, "t", memory.Principal{User: "u"}, changes[0].Memory.ID)
+	if err != nil || result.Status != "partial" || len(result.Changes) != 1 || result.Extraction == nil || len(result.Extraction.Facts) != 1 || len(result.Extraction.Issues) != 2 || p.calls != 1 {
+		t.Fatalf("background enrichment discarded healthy facts or repeated model work: %+v calls=%d %v", result, p.calls, err)
+	}
 }
 
+type extractionFixture struct {
+	calls  int
+	input  knowledge.EnrichmentInput
+	fail   error
+	after  func(context.Context, knowledge.EnrichmentInput) error
+	output *knowledge.Enrichment
+}
+
+func TestNonGroundedProviderOutputRequiresReview(t *testing.T) {
+	ctx := context.Background()
+	s := memstore.New(nil)
+	defer s.Close()
+	e, err := niromem.Open(niromem.Options{Store: s, Knowledge: niromem.KnowledgeOptions{Mode: "enforced", Planner: &extractionFixture{}, BackgroundEnrichment: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	changes, err := e.Remember(ctx, niromem.Fact{Scope: memory.Scope{Tenant: "t", User: "u"}, Text: "Completely unrelated source."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	js, err := s.Jobs(ctx, store.JobQuery{Tenant: "t", Kind: niromem.JobKnowledgeEnrich})
+	if err != nil || len(js) != 1 {
+		t.Fatalf("jobs: %v %v", js, err)
+	}
+	if err := e.Worker().Handlers[niromem.JobKnowledgeEnrich](ctx, js[0]); err != nil {
+		t.Fatal(err)
+	}
+	result, err := e.EnrichmentStatus(ctx, "t", memory.Principal{User: "u"}, changes[0].Memory.ID)
+	if err != nil || result.Status != "needs_review" || result.Error == "" || len(result.Changes) != 0 {
+		t.Fatalf("non-grounded output not isolated: %+v %v", result, err)
+	}
+}
+
+func TestIncompleteExtractionStaysRetryableAndPreservesOriginal(t *testing.T) {
+	for _, invalidEvidence := range []bool{false, true} {
+		t.Run(map[bool]string{false: "incomplete-generation", true: "invalid-evidence"}[invalidEvidence], func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Now()
+			clock := func() time.Time { return now }
+			s := memstore.New(clock)
+			p := &extractionFixture{fail: io.ErrUnexpectedEOF}
+			wantState := store.JobPending
+			if invalidEvidence {
+				p.fail = memory.ErrInvalid
+			}
+			e, err := niromem.Open(niromem.Options{Store: s, Now: clock, Knowledge: niromem.KnowledgeOptions{Mode: "enforced", Planner: p, BackgroundEnrichment: true}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.Close()
+			changes, err := e.Remember(ctx, niromem.Fact{Scope: memory.Scope{Tenant: "t", User: "u"}, Text: "Atlas decided to use Redis."})
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker := e.Worker()
+			worker.BaseBackoff = time.Hour
+			now = now.Add(2 * time.Second)
+			if _, err := worker.RunOnce(ctx, 100); err != nil {
+				t.Fatal(err)
+			}
+			rows, err := s.Jobs(ctx, store.JobQuery{Tenant: "t", Kind: niromem.JobKnowledgeEnrich})
+			if invalidEvidence {
+				if err != nil || len(rows) != 0 {
+					t.Fatalf("invalid extraction should complete with review receipt: %v %v", rows, err)
+				}
+				result, err := e.EnrichmentStatus(ctx, "t", memory.Principal{User: "u"}, changes[0].Memory.ID)
+				if err != nil || result.Status != "needs_review" || result.Error == "" {
+					t.Fatalf("missing explicit review: %+v %v", result, err)
+				}
+			} else if err != nil || len(rows) != 1 || rows[0].State != wantState || rows[0].Attempts != 1 || rows[0].LastError == "" || p.calls != 1 {
+				t.Fatalf("incorrect first-attempt classification %+v calls=%d err=%v", rows, p.calls, err)
+			}
+			original, err := s.Get(ctx, "t", []string{changes[0].Memory.ID})
+			if err != nil || len(original) != 1 || original[0].Text != "Atlas decided to use Redis." {
+				t.Fatalf("original lost: %+v %v", original, err)
+			}
+		})
+	}
+}
 func (*extractionFixture) Plan(ctx context.Context, in knowledge.Input, s knowledge.State) (knowledge.Plan, error) {
 	return (knowledge.Deterministic{}).Plan(ctx, in, s)
 }
@@ -36,8 +145,44 @@ func (p *extractionFixture) Enrich(ctx context.Context, in knowledge.EnrichmentI
 	if p.fail != nil {
 		return knowledge.Enrichment{}, p.fail
 	}
+	if p.output != nil {
+		return *p.output, nil
+	}
 	return knowledge.Enrichment{Facts: []knowledge.ExtractedFact{{Quote: in.Text, Subject: "Atlas", Predicate: "uses", Object: "Redis", Type: memory.EpistemicDecision}},
 		Relations: []knowledge.ExtractedRelation{}, Provider: "fixture", Model: "cpu-test"}, nil
+}
+
+func TestLegacyEvaluationUsesDurableEnrichmentAfterConfigurationUpgrade(t *testing.T) {
+	ctx := context.Background()
+	s := memstore.New(nil)
+	defer s.Close()
+	p := &extractionFixture{}
+	e, err := niromem.Open(niromem.Options{Store: s, Knowledge: niromem.KnowledgeOptions{
+		Mode: "enforced", Planner: p, BackgroundEnrichment: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	changes, err := e.Remember(ctx, niromem.Fact{Scope: memory.Scope{Tenant: "t", User: "u"}, Text: "Atlas decided to use Redis."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := changes[0].Memory.ID
+	js, err := s.Jobs(ctx, store.JobQuery{Tenant: "t", Kind: niromem.JobKnowledgeEnrich, Key: id})
+	if err != nil || len(js) != 1 {
+		t.Fatalf("source job: %+v %v", js, err)
+	}
+	old := js[0]
+	old.ID, old.Kind = "legacy-evaluation", niromem.JobKnowledgeEvaluate
+	for _, job := range []store.Job{old, old, js[0]} {
+		if err := e.Worker().Handlers[job.Kind](ctx, job); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := e.EnrichmentStatus(ctx, "t", memory.Principal{User: "u"}, id)
+	if err != nil || result.Status != "completed" || p.calls != 1 {
+		t.Fatalf("legacy/new jobs must share one durable extraction: %+v calls=%d err=%v", result, p.calls, err)
+	}
 }
 
 func TestDeletedSourceCannotReappearInEnrichmentReceipts(t *testing.T) {
@@ -80,6 +225,44 @@ type enrichmentCrashStore struct {
 	*memstore.Store
 	failSave  bool
 	failApply bool
+}
+
+func TestExtractionProfileSnapshotSurvivesSettingsChange(t *testing.T) {
+	ctx := context.Background()
+	s := &enrichmentCrashStore{Store: memstore.New(nil), failApply: true}
+	defer s.Close()
+	p := &extractionFixture{}
+	e, err := niromem.Open(niromem.Options{Store: s, Knowledge: niromem.KnowledgeOptions{Mode: "enforced", Planner: p, BackgroundEnrichment: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	changes, err := e.Remember(ctx, niromem.Fact{Scope: memory.Scope{Tenant: "t", User: "u"}, Text: "Atlas decided to use Redis."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := changes[0].Memory.ID
+	js, err := s.Jobs(ctx, store.JobQuery{Tenant: "t", Kind: niromem.JobKnowledgeEnrich, Key: id})
+	if err != nil || len(js) != 1 {
+		t.Fatal(err)
+	}
+	handle := e.Worker().Handlers[niromem.JobKnowledgeEnrich]
+	if err := handle(ctx, js[0]); err == nil {
+		t.Fatal("expected interrupted application")
+	}
+	changed := knowledge.DefaultExtractionProfile()
+	changed.EntityTypes = []string{"person"}
+	changed.FactTypes = []memory.EpistemicType{memory.EpistemicFact}
+	if err := e.PutSettings(ctx, "t", niromem.Settings{Knowledge: &niromem.KnowledgePolicy{Extraction: &changed}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle(ctx, js[0]); err != nil {
+		t.Fatal(err)
+	}
+	result, err := e.EnrichmentStatus(ctx, "t", memory.Principal{User: "u"}, id)
+	if err != nil || result.Status != "completed" || p.calls != 1 || result.Profile == nil || len(result.Schema) == 0 || !reflect.DeepEqual(*result.Profile, knowledge.DefaultExtractionProfile()) {
+		t.Fatalf("profile changed on retry: %+v calls=%d err=%v", result, p.calls, err)
+	}
 }
 
 func (s *enrichmentCrashStore) Write(ctx context.Context, b *store.Batch) (*store.Receipt, error) {

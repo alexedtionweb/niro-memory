@@ -20,14 +20,17 @@ import (
 const JobKnowledgeEnrich = "knowledge.enrich"
 
 type EnrichmentResult struct {
-	SourceID   string                `json:"source_id"`
-	Status     string                `json:"status"`
-	Mode       string                `json:"mode"`
-	Extraction *knowledge.Enrichment `json:"extraction,omitempty"`
-	Changes    []pipeline.Change     `json:"changes,omitempty"`
-	Relations  []relations.Link      `json:"relations,omitempty"`
-	Error      string                `json:"error,omitempty"`
-	Duration   time.Duration         `json:"duration_ns,omitempty"`
+	SourceID   string                       `json:"source_id"`
+	Status     string                       `json:"status"`
+	Mode       string                       `json:"mode"`
+	Extraction *knowledge.Enrichment        `json:"extraction,omitempty"`
+	Changes    []pipeline.Change            `json:"changes,omitempty"`
+	Relations  []relations.Link             `json:"relations,omitempty"`
+	Error      string                       `json:"error,omitempty"`
+	Reason     string                       `json:"reason,omitempty"`
+	Duration   time.Duration                `json:"duration_ns,omitempty"`
+	Profile    *knowledge.ExtractionProfile `json:"extraction_profile,omitempty"`
+	Schema     json.RawMessage              `json:"extraction_schema,omitempty"`
 }
 
 func enrichmentKey(id string) string { return "enrichment:" + id }
@@ -121,6 +124,14 @@ func (e *Engine) handleKnowledgeEnrich(ctx context.Context, j store.Job) error {
 	if !ok {
 		return jobs.Permanent(fmt.Errorf("selected knowledge planner does not support background enrichment"))
 	}
+	if profile, ok := options.Planner.(interface{ KnowledgeExtractionMode() string }); ok &&
+		profile.KnowledgeExtractionMode() == "extractive" && source.Source.Kind == "document" {
+		result.Status = "source_only"
+		result.Reason = "Document passages are already indexed with section context; extractive copies would add no knowledge. No model call or derived memories."
+		_, err = e.o.Store.Write(ctx, &store.Batch{Tenant: j.Tenant, OperationKey: key, OperationHash: hash, Result: payload(result),
+			Checks: []store.Check{{ID: source.ID, Version: source.Version, Open: true}}})
+		return err
+	}
 	if options.Admission != nil {
 		callCtx, cancel := context.WithTimeout(ctx, options.Timeout)
 		decision, err := options.Admission.DecideAdmission(callCtx, knowledge.AdmissionInput{
@@ -143,7 +154,7 @@ func (e *Engine) handleKnowledgeEnrich(ctx context.Context, j store.Job) error {
 	if len(source.Text) > 6000 {
 		return jobs.Permanent(fmt.Errorf("%w: enrichment source exceeds 6000 bytes; split the input", memory.ErrInvalid))
 	}
-	input := knowledge.EnrichmentInput{Text: source.Text, Candidates: []memory.Memory{}}
+	input := knowledge.EnrichmentInput{Text: source.Text, Candidates: []memory.Memory{}, Profile: options.Extraction}
 	// Candidate selection and every resulting link preserve exact owner/audience.
 	candidates, err := e.o.Store.Find(ctx, store.Query{Tenant: j.Tenant, Limit: 64,
 		Filter: memory.And(memory.Eq("user_id", source.User), memory.Eq("agent_id", source.Agent)), Order: store.NewestFirst})
@@ -167,10 +178,12 @@ func (e *Engine) handleKnowledgeEnrich(ctx context.Context, j store.Job) error {
 	// Persist the exact input and output together. A retried worker cannot
 	// reinterpret candidate indexes after concurrent writes change their order.
 	var saved struct {
-		InputText  string               `json:"text"`
-		Candidates []memory.Memory      `json:"candidates"`
-		Output     knowledge.Enrichment `json:"output"`
-		Duration   time.Duration        `json:"duration_ns"`
+		InputText  string                       `json:"text"`
+		Candidates []memory.Memory              `json:"candidates"`
+		Output     knowledge.Enrichment         `json:"output"`
+		Duration   time.Duration                `json:"duration_ns"`
+		Profile    *knowledge.ExtractionProfile `json:"profile,omitempty"`
+		Schema     json.RawMessage              `json:"schema,omitempty"`
 	}
 	planKey := key + ":plan"
 	planned, err := e.replayOperation(ctx, j.Tenant, planKey, hash, &saved)
@@ -182,17 +195,34 @@ func (e *Engine) handleKnowledgeEnrich(ctx context.Context, j store.Job) error {
 		callCtx, cancel := context.WithTimeout(ctx, options.Timeout)
 		out, err := enricher.Enrich(callCtx, input)
 		cancel()
+		if err == nil {
+			out, err = knowledge.RecoverEnrichment(input, out)
+			if err == nil && len(out.Facts) == 0 && len(out.Entities) == 0 && len(out.Issues) > 0 {
+				err = fmt.Errorf("%w: no valid extraction records: %s", memory.ErrInvalid, out.Issues[0].Reason)
+			}
+		}
 		if err != nil {
-			if errors.Is(err, memory.ErrInvalid) {
-				return jobs.Permanent(fmt.Errorf("extract knowledge: %w", err))
+			var review *knowledge.ExtractionReviewRequired
+			if errors.As(err, &review) || errors.Is(err, memory.ErrInvalid) {
+				result.Status = "needs_review"
+				result.Error = err.Error()
+				result.Duration = time.Since(start)
+				_, writeErr := e.o.Store.Write(ctx, &store.Batch{Tenant: j.Tenant, OperationKey: key, OperationHash: hash, Result: payload(result),
+					Checks: []store.Check{{ID: source.ID, Version: source.Version, Open: true}}})
+				if writeErr != nil {
+					return writeErr
+				}
+				e.o.Logger.Warn("knowledge extraction needs review", "source_id", source.ID, "job", j.ID, "err", err)
+				return nil
 			}
 			return fmt.Errorf("extract knowledge: %w", err)
 		}
-		out, err = knowledge.NormalizeEnrichment(input, out)
+		saved.InputText, saved.Candidates, saved.Output = input.Text, input.Candidates, out
+		saved.Profile = input.Profile
+		saved.Schema, err = knowledge.ExtractionJSONSchema(input.Profile)
 		if err != nil {
 			return jobs.Permanent(err)
 		}
-		saved.InputText, saved.Candidates, saved.Output = input.Text, input.Candidates, out
 		saved.Duration = time.Since(start)
 		checks := []store.Check{{ID: source.ID, Version: source.Version, Open: true}}
 		for _, m := range input.Candidates {
@@ -207,13 +237,25 @@ func (e *Engine) handleKnowledgeEnrich(ctx context.Context, j store.Job) error {
 		}
 	} else {
 		input.Text, input.Candidates = saved.InputText, saved.Candidates
+		input.Profile = saved.Profile
 	}
 	if err := knowledge.ValidateEnrichment(input, saved.Output); err != nil {
 		return jobs.Permanent(err)
 	}
 	result.Extraction = &saved.Output
+	result.Profile = saved.Profile
+	result.Schema = saved.Schema
 	result.Duration = saved.Duration
 	result.Status = "completed"
+	if len(saved.Output.Facts) == 0 && len(saved.Output.Entities) == 0 && len(saved.Output.Excerpts) == 0 {
+		result.Status = "empty"
+		result.Reason = "The model returned no structured records. Source text remains searchable; this is not proof the source contains no useful information."
+	}
+	if len(saved.Output.Issues) > 0 {
+		result.Status = "partial"
+		result.Reason = "Grounded results saved; rejected extraction records require review or document repair."
+		e.o.Logger.Warn("knowledge extraction partially recovered", "source_id", source.ID, "issues", len(saved.Output.Issues))
+	}
 	for _, r := range saved.Output.Relations {
 		target := input.Candidates[r.Candidate]
 		currentTargets, err := e.o.Store.Get(ctx, j.Tenant, []string{target.ID})
@@ -231,8 +273,45 @@ func (e *Engine) handleKnowledgeEnrich(ctx context.Context, j store.Job) error {
 		Checks: []store.Check{{ID: source.ID, Version: source.Version, Open: true}}}
 	if options.Mode == "shadow" {
 		result.Status = "shadow"
+	} else if len(saved.Output.Excerpts) > 0 {
+		proposals := make([]pipeline.Proposal, 0, len(saved.Output.Excerpts))
+		for i, text := range saved.Output.Excerpts {
+			m := memory.Memory{ID: memory.Hash(key + ":excerpt:" + strconv.Itoa(i)), Scope: source.Scope, Text: text,
+				Confidence: source.Confidence, Importance: source.Importance, Visibility: source.Visibility, Grants: append([]string(nil), source.Grants...),
+				ValidFrom: source.ValidFrom, ValidTo: source.ValidTo, ExpiresAt: source.ExpiresAt,
+				Source: memory.Source{Kind: "knowledge_enriched", Actor: source.Source.Actor, Role: source.Source.Role, Trust: source.Source.Trust,
+					DerivedBy: saved.Output.Provider + "/" + saved.Output.Model, Evidence: source.Source.Evidence},
+				Metadata: map[string]any{"document_id": source.Metadata["document_id"], "revision_id": source.Metadata["revision_id"], "enrichment": map[string]any{"source_id": source.ID, "source_version": source.Version, "quote": text,
+					"start": strings.Index(source.Text, text), "end": strings.Index(source.Text, text) + len(text),
+					"provider": saved.Output.Provider, "model": saved.Output.Model, "review": "unreviewed", "mode": "extractive"}}}
+			proposals = append(proposals, pipeline.Proposal{Memory: m})
+		}
+		result.Changes, err = e.rec.Plan(ctx, j.Tenant, proposals, b)
+		if err != nil {
+			return err
+		}
+		for _, change := range result.Changes {
+			if change.Action == pipeline.ActionReject {
+				return jobs.Permanent(fmt.Errorf("%w: extractive memory rejected: %s", memory.ErrInvalid, change.Reason))
+			}
+		}
+		e.followUp(b, result.Changes)
 	} else {
-		for i, f := range saved.Output.Facts {
+		facts := append([]knowledge.ExtractedFact(nil), saved.Output.Facts...)
+		for _, entity := range saved.Output.Entities {
+			associated := false
+			for _, f := range saved.Output.Facts {
+				if strings.Contains(strings.ToLower(f.Quote), strings.ToLower(entity.Name)) {
+					associated = true
+					break
+				}
+			}
+			if !associated {
+				facts = append(facts, knowledge.ExtractedFact{Subject: entity.Name, Predicate: "mentioned_as", Object: entity.Type,
+					Quote: entity.Quote, Type: memory.EpistemicObservation})
+			}
+		}
+		for i, f := range facts {
 			now := e.o.Now()
 			polarity := "positive"
 			if f.Negated {
@@ -243,11 +322,19 @@ func (e *Engine) handleKnowledgeEnrich(ctx context.Context, j store.Job) error {
 			if f.Type == memory.EpistemicDecision {
 				decision = &memory.DecisionMetadata{Subject: f.Subject, Outcome: f.Quote, Status: memory.DecisionProposed, EvidenceIDs: []string{source.ID}}
 			}
-			meta, err := memory.WithKnowledgeMetadata(map[string]any{"enrichment": map[string]any{
+			refs, entities := entityAnnotations(f, saved.Output.Entities)
+			if i >= len(saved.Output.Facts) {
+				refs = nil
+				for _, entity := range entities {
+					refs = append(refs, memory.EntityRef{Name: entity.Name, Type: entity.Type})
+				}
+			}
+			meta, err := memory.WithKnowledgeMetadata(map[string]any{"document_id": source.Metadata["document_id"], "revision_id": source.Metadata["revision_id"], "extracted_entities": entities, "enrichment": map[string]any{
 				"source_id": source.ID, "source_version": source.Version, "quote": f.Quote, "start": strings.Index(source.Text, f.Quote),
 				"end":      strings.Index(source.Text, f.Quote) + len(f.Quote),
 				"provider": saved.Output.Provider, "model": saved.Output.Model, "review": "unreviewed",
-				"model_type": f.ModelType,
+				"model_type":     f.ModelType,
+				"entity_mention": i >= len(saved.Output.Facts),
 			}}, a, decision)
 			if err != nil {
 				return jobs.Permanent(err)
@@ -256,23 +343,31 @@ func (e *Engine) handleKnowledgeEnrich(ctx context.Context, j store.Job) error {
 				Subject: f.Subject, Predicate: f.Predicate, Object: f.Object, Confidence: .5, Importance: source.Importance,
 				Visibility: source.Visibility, Grants: append([]string(nil), source.Grants...),
 				ValidFrom: source.ValidFrom, ValidTo: source.ValidTo, ExpiresAt: source.ExpiresAt,
-				Entities: []memory.EntityRef{{Name: f.Subject}, {Name: f.Object}},
+				Entities: refs,
 				Source: memory.Source{Kind: "knowledge_enriched", Actor: source.Source.Actor, Role: source.Source.Role,
 					Trust: source.Source.Trust, DerivedBy: saved.Output.Provider + "/" + saved.Output.Model, Evidence: source.Source.Evidence}}
 			pipeline.Prepare(&m, now)
 			if err := m.Validate(e.o.Limits); err != nil {
 				return jobs.Permanent(err)
 			}
-			b.Memories = append(b.Memories, m)
-			b.Events = append(b.Events, memory.Event{MemoryID: m.ID, Action: memory.ActionAdd, New: m.Text, Related: source.ID, Reason: "grounded_extraction:unreviewed", At: now})
-			result.Changes = append(result.Changes, pipeline.Change{Action: memory.ActionAdd, Memory: m, Reason: "grounded_extraction:unreviewed"})
+			change, err := e.reconcileEnriched(ctx, b, m, f, entities, source)
+			if err != nil {
+				if errors.Is(err, memory.ErrInvalid) {
+					return jobs.Permanent(err)
+				}
+				return err
+			}
+			result.Changes = append(result.Changes, change)
 			b.Relations = append(b.Relations, relations.Link{ID: memory.Hash(key + ":source:" + strconv.Itoa(i)), Tenant: j.Tenant,
-				Source: m.ID, Target: source.ID, Relation: "derived_from", Origin: "inferred", Confidence: .5, Reason: f.Quote,
+				Source: change.Memory.ID, Target: source.ID, Relation: "derived_from", Origin: "inferred", Confidence: .5, Reason: f.Quote,
 				Provider: m.Source.DerivedBy, OperationKey: key, At: now, ValidFrom: m.ValidFrom, Evidence: m.Source.Evidence})
 		}
 		for i, r := range saved.Output.Relations {
 			target := input.Candidates[r.Candidate]
 			fact := result.Changes[r.Fact].Memory
+			if fact.ID == target.ID {
+				continue
+			}
 			b.Checks = append(b.Checks, store.Check{ID: target.ID, Version: target.Version, Open: true})
 			b.Relations = append(b.Relations, relations.Link{ID: memory.Hash(key + ":relation:" + strconv.Itoa(i)), Tenant: j.Tenant,
 				Source: fact.ID, Target: target.ID, Relation: r.Relation, Origin: "inferred", Confidence: .5, Reason: fact.Text,

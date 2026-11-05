@@ -124,6 +124,9 @@ type Check struct {
 	ID      string
 	Version int
 	Open    bool
+	// NoMatch conditionally reserves a matching set inside the write transaction.
+	// It is tenant-scoped and includes historical rows unless the filter excludes them.
+	NoMatch *memory.Filter
 }
 
 // Operations reads committed operation receipts, or memory.ErrNotFound.
@@ -334,9 +337,11 @@ type JobState string
 
 // Job states. Completed jobs are deleted.
 const (
-	JobPending JobState = "pending"
-	JobLeased  JobState = "leased"
-	JobDead    JobState = "dead"
+	JobPending   JobState = "pending"
+	JobLeased    JobState = "leased"
+	JobDead      JobState = "dead"
+	JobPaused    JobState = "paused"
+	JobCancelled JobState = "cancelled"
 )
 
 // Job is a durable unit of background work.
@@ -348,6 +353,7 @@ type Job struct {
 	Payload    json.RawMessage `json:"payload,omitempty"`
 	State      JobState        `json:"state"`
 	Attempts   int             `json:"attempts"`
+	Priority   int             `json:"priority"`
 	NotBefore  time.Time       `json:"not_before"`
 	LeaseUntil time.Time       `json:"lease_until,omitempty"`
 	Worker     string          `json:"worker,omitempty"`
@@ -360,8 +366,10 @@ type Job struct {
 // Queue is a durable job queue with leases.
 type Queue interface {
 	// Claim leases up to n due jobs for worker. Claims are fair across
-	// tenants, and a job is not claimed while another job with the same
-	// tenant, kind and key holds a live lease.
+	// tenants, ordered by descending priority within each tenant. A job is not
+	// claimed while another job with the same tenant, kind and key holds a live
+	// lease. Use a fresh worker identity for each Claim invocation to fence old
+	// executions after administrative retry/resume.
 	Claim(ctx context.Context, worker string, n int, lease time.Duration) ([]Job, error)
 	// Heartbeat extends a lease, saving checkpoint when non-nil. It fails
 	// with memory.ErrConflict if the worker no longer holds the lease.
@@ -375,8 +383,10 @@ type Queue interface {
 
 // Outcome is the result of running a job.
 type Outcome struct {
-	Done    bool
-	Dead    bool
+	Done bool
+	Dead bool
+	// Yield requeues progress without consuming an attempt.
+	Yield   bool
 	RetryAt time.Time
 	Error   string
 }
@@ -384,8 +394,11 @@ type Outcome struct {
 // JobQuery filters jobs for inspection. Empty fields match all.
 type JobQuery struct {
 	Tenant string
-	State  JobState
-	Kind   string
-	Key    string
-	Limit  int
+	ID     string
+	// AfterID is an exclusive cursor in ascending ID order.
+	AfterID string
+	State   JobState
+	Kind    string
+	Key     string
+	Limit   int
 }

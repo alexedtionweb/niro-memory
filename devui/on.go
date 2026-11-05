@@ -30,6 +30,7 @@ func Handler(o Options) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /_dev/", http.StripPrefix("/_dev/", http.FileServerFS(sub)))
 	d := &dev{o}
+	mux.HandleFunc("GET /_dev/views/{screen}", d.workspace)
 	d.route(mux, "GET /_dev/api/info", d.info)
 	d.route(mux, "GET /_dev/api/knowledge/config", d.knowledgeConfig)
 	d.route(mux, "GET /_dev/api/tenants", d.tenants)
@@ -37,6 +38,7 @@ func Handler(o Options) http.Handler {
 	d.route(mux, "POST /_dev/api/sql", d.sql)
 	d.route(mux, "GET /_dev/api/jobs", d.jobs)
 	d.route(mux, "POST /_dev/api/jobs/retry", d.retry)
+	d.route(mux, "POST /_dev/api/jobs/control", d.controlJob)
 	d.route(mux, "POST /_dev/api/jobs/run", d.runJobs)
 	d.route(mux, "GET /_dev/api/metrics", d.metrics)
 	d.route(mux, "GET /_dev/api/rules", d.rulesDoc)
@@ -51,7 +53,7 @@ func (d *dev) knowledgeConfig(w http.ResponseWriter, r *http.Request, id api.Ide
 // securityHeaders keeps the console from being framed or loading remote code.
 func securityHeaders(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' blob: data:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; frame-src blob:; object-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
 		h.ServeHTTP(w, r)
@@ -102,8 +104,12 @@ func (d *dev) info(w http.ResponseWriter, r *http.Request, id api.Identity) (any
 	}
 	capabilities := d.o.Engine.Capabilities()
 	capabilities.KnowledgeMode = knowledge.Effective.Mode
-	return map[string]any{"tenant": id.Tenant, "capabilities": capabilities, "knowledge": knowledge, "policies": pol,
-		"sql": sqlOK, "metrics": d.o.Metrics != nil}, nil
+	vectors, err := d.o.Engine.VectorConfiguration(r.Context(), id.Tenant)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"tenant": id.Tenant, "capabilities": capabilities, "knowledge": knowledge, "vectors": vectors, "policies": pol,
+		"sql": sqlOK, "metrics": d.o.Metrics != nil, "inline_worker": d.o.InlineWorker}, nil
 }
 
 func (d *dev) tenants(w http.ResponseWriter, r *http.Request, id api.Identity) (any, error) {
@@ -174,10 +180,18 @@ func (d *dev) jobs(w http.ResponseWriter, r *http.Request, id api.Identity) (any
 	if q.Get("all") == "" {
 		tenant = id.Tenant
 	}
-	return d.o.Engine.Store().Jobs(r.Context(), store.JobQuery{Tenant: tenant, State: store.JobState(q.Get("state")), Kind: q.Get("kind"), Limit: 500})
+	limit := 101
+	jobs, err := d.o.Engine.Store().Jobs(r.Context(), store.JobQuery{Tenant: tenant, State: store.JobState(q.Get("state")), Kind: q.Get("kind"), ID: q.Get("id"), AfterID: q.Get("after_id"), Limit: limit})
+	if err != nil {
+		return nil, err
+	}
+	if jobs == nil {
+		jobs = []store.Job{}
+	}
+	return d.jobSources(r.Context(), jobs)
 }
 
-// retry enqueues a fresh copy of a dead job.
+// retry keeps the original job identity; repeated legacy requests are safe.
 func (d *dev) retry(w http.ResponseWriter, r *http.Request, id api.Identity) (any, error) {
 	var body struct {
 		ID string `json:"id"`
@@ -185,23 +199,54 @@ func (d *dev) retry(w http.ResponseWriter, r *http.Request, id api.Identity) (an
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		return nil, err
 	}
-	js, err := d.o.Engine.Store().Jobs(r.Context(), store.JobQuery{Tenant: id.Tenant, State: store.JobDead})
+	js, err := d.o.Engine.Store().Jobs(r.Context(), store.JobQuery{Tenant: id.Tenant, ID: body.ID, Limit: 1})
 	if err != nil {
 		return nil, err
 	}
 	for _, j := range js {
 		if j.ID == body.ID {
-			_, err := d.o.Engine.Store().Write(r.Context(), &store.Batch{Tenant: id.Tenant, Jobs: []store.Job{{Kind: j.Kind, Key: j.Key, Payload: j.Payload}}})
-			return map[string]string{"status": "requeued"}, err
+			if j.State == store.JobPending {
+				return map[string]any{"status": "requeued", "replayed": true}, nil
+			}
+			controller, ok := d.o.Engine.Store().(store.JobController)
+			if !ok {
+				return nil, errors.New("store does not support job controls")
+			}
+			if _, err := controller.JobControl(r.Context(), store.JobControl{Tenant: id.Tenant, ID: j.ID, Action: store.JobRetry}); err != nil {
+				return nil, err
+			}
+			return map[string]any{"status": "requeued", "replayed": false}, nil
 		}
+
 	}
 	return nil, memory.ErrNotFound
 }
 
+func (d *dev) controlJob(w http.ResponseWriter, r *http.Request, id api.Identity) (any, error) {
+	var body store.JobControl
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+	if body.Tenant != "" && body.Tenant != id.Tenant {
+		return nil, memory.ErrNotFound
+	}
+	body.Tenant = id.Tenant
+	controller, ok := d.o.Engine.Store().(store.JobController)
+	if !ok {
+		return nil, errors.New("store does not support job controls")
+	}
+	return controller.JobControl(r.Context(), body)
+}
+
 func (d *dev) runJobs(w http.ResponseWriter, r *http.Request, id api.Identity) (any, error) {
+	if d.o.InlineWorker {
+		return nil, errors.New("inline worker is active; jobs are processed automatically, not by an additional manual worker")
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	n, err := d.o.Engine.Worker().RunOnce(ctx, 50)
+	worker := d.o.Engine.Worker()
+	worker.Concurrency = 1
+	n, err := worker.RunOnce(ctx, 1)
 	return map[string]int{"processed": n}, err
 }
 

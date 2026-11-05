@@ -9,7 +9,7 @@ go run -tags devui ./cmd/niromem serve -dev-ui -mcp -mcp-user my-project
 ```
 
 This starts the memory API, SQLite storage, background worker, development UI,
-and MCP tools together. MCP calls the engine directly, not another HTTP service.
+and MCP tools together. MCP reuses native API authorization in-process, not another HTTP service.
 No adapter process, `NIROMEM_URL`, MCP SDK, or additional dependencies are needed.
 The CLI's SQLite connector still supplies the database driver.
 
@@ -56,9 +56,11 @@ for an untrusted or shared machine.
 
 With a configured key-authenticated API, `/mcp` uses the **same API keys**.
 Configure Claude's authorization header using your approved secret mechanism.
-The key's tenant determines the tenant, and any bound user/agent must match the
-configured MCP identity. Wrong bindings are rejected; keys cannot act for
-another tenant. No separate `NIROMEM_MCP_TOKEN` is used by integrated mode.
+The key determines the tenant and permissions, just as in the UI. Admin keys can
+read all users in their tenant; bound keys remain restricted and select their own
+default write owner. `-mcp-user`/`-mcp-agent` are fallback write defaults, not
+hidden read filters. Keys cannot act for another tenant.
+No separate `NIROMEM_MCP_TOKEN` is used by integrated mode.
 Do not commit credentials.
 
 The development UI still requires `-tags devui` and `-dev-ui` and is refused
@@ -78,6 +80,14 @@ server's localhost are not the same.
 | --- | --- |
 | `search_memory` | Recall relevant facts, conventions, or previous decisions |
 | `remember_memory` | Save an explicitly approved durable fact |
+| `workspace_info` | Discover permissions, models, capabilities and extraction schema |
+| `list_memories`, `get_memory`, `memory_history`, `memory_versions` | Browse and inspect the same authorized memories as the UI |
+| `update_memory`, `invalidate_memory`, `delete_memory` | Confirmed memory lifecycle operations |
+| `list_jobs`, `control_job`, `document_status` | Inspect progress/errors and control durable work |
+| `import_document`, `import_media` | Queue approved document/multimodal evidence |
+
+The complete [workspace catalogue](../../docs/mcp.md) includes knowledge, graph,
+embedding, settings and confirmed tenant-wide cleanup tools.
 
 Example requests to Claude:
 
@@ -87,8 +97,11 @@ Example requests to Claude:
 > `convention.input_validation`.
 
 An optional stable `slot` replaces that property's previous value through
-versioned reconciliation. Omit it for independent facts. Search returns at
-most eight hits. Calls have a five-second timeout; tool errors have
+versioned reconciliation. Omit it for independent facts. Search returns 10 hits
+by default, up to 100, with optional policy and scope filters. Search and
+knowledge planning/commit allow 75 seconds; other tools allow five seconds.
+Destructive/admin mutations require explicit approval and `confirm:true`;
+delete-all also requires the exact tenant name and stable request ID. Tool errors have
 `"isError":true`, rather than a successful empty result.
 
 MCP does not automatically capture transcripts or inject context. Claude calls

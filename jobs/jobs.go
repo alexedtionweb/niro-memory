@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/alexedtionweb/niro-memory/memory"
 	"github.com/alexedtionweb/niro-memory/store"
 )
 
@@ -35,11 +36,18 @@ func (p permanent) Unwrap() error { return p.err }
 // Permanent wraps err so the job is dead-lettered without retries.
 func Permanent(err error) error { return permanent{err} }
 
+var errYield = errors.New("job yielded")
+
+// Yield requeues a checkpointed job immediately without consuming an attempt.
+// Handlers should durably commit progress before yielding.
+func Yield() error { return errYield }
+
 // Runner executes jobs. Configure it with fields; zero values are sensible.
 type Runner struct {
 	Queue    store.Queue
 	Handlers map[string]Handler
-	// Worker identifies this runner in leases (default: host-pid-random).
+	// Worker identifies this runner (default: host-pid-random). Each claim
+	// appends a unique lease identity, fencing earlier executions on retry.
 	Worker      string
 	Concurrency int           // parallel jobs (default 4)
 	Lease       time.Duration // lease length (default 30s); renewed at 1/3
@@ -95,7 +103,7 @@ func (r *Runner) RunOnce(ctx context.Context, max int) (int, error) {
 	if max <= 0 {
 		max = r.Concurrency
 	}
-	js, err := r.Queue.Claim(ctx, r.Worker, max, r.Lease)
+	js, err := r.Queue.Claim(ctx, r.Worker+"/"+memory.NewID(), max, r.Lease)
 	if err != nil {
 		return 0, err
 	}
@@ -148,29 +156,56 @@ func (r *Runner) run(parent context.Context, j store.Job) {
 	stop := r.heartbeat(ctx, j, cancel)
 	start := r.Now()
 	err := r.call(ctx, j)
-	stop()
+	leaseErr := stop()
 	took := r.Now().Sub(start)
 	if r.Observe != nil {
 		r.Observe(j.Kind, took, err)
+	}
+	if leaseErr != nil {
+		r.logLeaseFailure(parent, j, "heartbeat", leaseErr)
+		return
 	}
 	var out store.Outcome
 	var p permanent
 	switch {
 	case err == nil:
 		out.Done = true
+	case errors.Is(err, errYield):
+		out.Yield, out.RetryAt = true, r.Now()
 	case errors.As(err, &p) || j.Attempts >= r.MaxAttempts:
 		out.Dead, out.Error = true, err.Error()
-		r.Logger.Error("job dead", "kind", j.Kind, "id", j.ID, "attempts", j.Attempts, "err", err)
 	default:
 		out.Error, out.RetryAt = err.Error(), r.Now().Add(r.backoff(j.Attempts))
-		r.Logger.Warn("job failed, will retry", "kind", j.Kind, "id", j.ID, "attempts", j.Attempts, "err", err)
 	}
 	// Finish even if the caller is shutting down, so the lease is released.
 	fctx, fcancel := context.WithTimeout(context.WithoutCancel(parent), 10*time.Second)
 	defer fcancel()
-	if ferr := r.Queue.Finish(fctx, j.ID, r.Worker, out); ferr != nil {
-		r.Logger.Warn("finish failed (lease lost?)", "kind", j.Kind, "id", j.ID, "err", ferr)
+	if ferr := r.Queue.Finish(fctx, j.ID, j.Worker, out); ferr != nil {
+		r.logLeaseFailure(parent, j, "finish", ferr)
+		return
 	}
+	if out.Dead {
+		r.Logger.Error("job dead", "kind", j.Kind, "id", j.ID, "attempts", j.Attempts, "err", err)
+	} else if out.Error != "" {
+		r.Logger.Warn("job failed, will retry", "kind", j.Kind, "id", j.ID, "attempts", j.Attempts, "err", err)
+	}
+}
+
+func (r *Runner) logLeaseFailure(parent context.Context, j store.Job, stage string, err error) {
+	if errors.Is(err, memory.ErrConflict) {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 10*time.Second)
+		defer cancel()
+		current, lookupErr := r.Queue.Jobs(ctx, store.JobQuery{Tenant: j.Tenant, ID: j.ID, Limit: 1})
+		if lookupErr != nil {
+			r.Logger.Warn("job ownership lookup failed", "kind", j.Kind, "id", j.ID, "stage", stage, "err", err, "lookup_err", lookupErr)
+			return
+		}
+		if len(current) == 0 || current[0].State == store.JobPaused || current[0].State == store.JobCancelled {
+			r.Logger.Info("job ownership revoked; stale result not applied", "kind", j.Kind, "id", j.ID, "stage", stage)
+			return
+		}
+	}
+	r.Logger.Warn("job lease operation failed; stale result not applied", "kind", j.Kind, "id", j.ID, "stage", stage, "err", err)
 }
 
 func (r *Runner) call(ctx context.Context, j store.Job) (err error) {
@@ -187,9 +222,11 @@ func (r *Runner) call(ctx context.Context, j store.Job) (err error) {
 }
 
 // heartbeat renews the lease every Lease/3 and cancels the job when the
-// lease is lost, so two workers never keep running the same job.
-func (r *Runner) heartbeat(ctx context.Context, j store.Job, cancel context.CancelFunc) func() {
+// lease is lost or administratively revoked. Handlers must honor the context;
+// cancellation cannot undo committed effects or forcibly stop ignored contexts.
+func (r *Runner) heartbeat(ctx context.Context, j store.Job, cancel context.CancelFunc) func() error {
 	done := make(chan struct{})
+	var leaseErr error
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -203,15 +240,15 @@ func (r *Runner) heartbeat(ctx context.Context, j store.Job, cancel context.Canc
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if err := r.Queue.Heartbeat(ctx, j.ID, r.Worker, r.Lease, nil); err != nil {
-					r.Logger.Warn("lease lost", "kind", j.Kind, "id", j.ID, "err", err)
+				if err := r.Queue.Heartbeat(ctx, j.ID, j.Worker, r.Lease, nil); err != nil {
+					leaseErr = err
 					cancel()
 					return
 				}
 			}
 		}
 	}()
-	return func() { close(done); wg.Wait() }
+	return func() error { close(done); wg.Wait(); return leaseErr }
 }
 
 func (r *Runner) backoff(attempt int) time.Duration {

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/alexedtionweb/niro-memory/knowledge"
 )
 
 // Config is the server configuration file (JSON). ${VAR} references are
@@ -22,7 +24,12 @@ type Config struct {
 	Cache         Choice          `json:"cache"`
 	Embedder      Choice          `json:"embedder"`
 	Relationships Choice          `json:"relationships"`
+	Multimodal    Choice          `json:"multimodal"`
 	Knowledge     KnowledgeConfig `json:"knowledge"`
+	Documents     struct {
+		Enabled     bool `json:"enabled"`
+		Concurrency int  `json:"concurrency"`
+	} `json:"documents"`
 
 	// Rules is a path to a rules file (see configs/rules.example.json).
 	Rules string `json:"rules"`
@@ -40,9 +47,10 @@ type Config struct {
 }
 
 type KnowledgeConfig struct {
-	BackgroundEnrichment bool   `json:"background_enrichment"`
-	Mode                 string `json:"mode"`
-	Planner              Choice `json:"planner"`
+	Extraction           *knowledge.ExtractionProfile `json:"extraction,omitempty"`
+	BackgroundEnrichment bool                         `json:"background_enrichment"`
+	Mode                 string                       `json:"mode"`
+	Planner              Choice                       `json:"planner"`
 	// Profiles are constructed only when the development console is enabled.
 	Profiles      map[string]Choice `json:"profiles,omitempty"`
 	MaxCandidates int               `json:"max_candidates"`
@@ -174,8 +182,8 @@ func (cfg *Config) validateKnowledge() error {
 	if cfg.Knowledge.TimeoutMS == 0 {
 		cfg.Knowledge.TimeoutMS = 2000
 	}
-	if cfg.Knowledge.TimeoutMS < 1 || cfg.Knowledge.TimeoutMS > 30000 {
-		return fmt.Errorf("config: knowledge.timeout_ms must be between 1 and 30000")
+	if cfg.Knowledge.TimeoutMS < 1 || cfg.Knowledge.TimeoutMS > 1800000 {
+		return fmt.Errorf("config: knowledge.timeout_ms must be between 1 and 1800000")
 	}
 	if cfg.Knowledge.Admission.MaxTextBytes < 0 || cfg.Knowledge.Admission.MaxTextBytes > 1<<20 {
 		return fmt.Errorf("config: knowledge.admission.max_text_bytes must be between 0 and 1048576")

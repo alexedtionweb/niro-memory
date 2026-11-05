@@ -229,6 +229,13 @@ func (s *Store) Write(ctx context.Context, b *store.Batch) (*store.Receipt, erro
 			return err
 		}
 		var err error
+		var fenced bool
+		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM tenant_purges WHERE tenant=$1 AND state<>'complete')`, b.Tenant).Scan(&fenced); err != nil {
+			return err
+		}
+		if fenced {
+			return conflict("tenant cleanup is in progress; writes are locked")
+		}
 		rec, err = (&writer{tx: tx, ctx: ctx, t: b.Tenant, now: utc(s.now())}).apply(b)
 		return err
 	})
@@ -511,6 +518,9 @@ func (w *writer) appendEpisode(e *memory.Episode) (store.EpisodeResult, error) {
 }
 
 func (w *writer) enqueue(j store.Job) error {
+	if err := store.ValidateJobPriority(j.Priority); err != nil {
+		return err
+	}
 	if j.NotBefore.IsZero() {
 		j.NotBefore = w.now
 	}
@@ -524,8 +534,8 @@ func (w *writer) enqueue(j store.Job) error {
 			return err
 		}
 	}
-	_, err := w.exec(`INSERT INTO jobs (id, tenant, kind, key, payload, state, not_before, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,'pending',$6,$7,$7)`,
-		j.ID, w.t, j.Kind, j.Key, []byte(j.Payload), utc(j.NotBefore), w.now)
+	_, err := w.exec(`INSERT INTO jobs (id, tenant, kind, key, payload, state, not_before, created_at, updated_at, priority) VALUES ($1,$2,$3,$4,$5,'pending',$6,$7,$7,$8)`,
+		j.ID, w.t, j.Kind, j.Key, []byte(j.Payload), utc(j.NotBefore), w.now, j.Priority)
 	return err
 }
 

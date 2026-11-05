@@ -20,6 +20,7 @@ import (
 )
 
 type KnowledgeOptions struct {
+	Extraction           *knowledge.ExtractionProfile
 	Mode                 string
 	Planner              knowledge.Planner
 	Admission            knowledge.AdmissionDecider
@@ -520,6 +521,11 @@ func (e *Engine) handleKnowledgeEvaluate(ctx context.Context, j store.Job) error
 	var prior KnowledgeResult
 	if replayed, err := e.replayOperation(ctx, j.Tenant, "knowledge.commit:"+req.Input.OperationKey, inputHash, &prior); replayed || err != nil {
 		return err
+	}
+	if options.BackgroundEnrichment {
+		// Jobs queued before enabling extraction use the same source-keyed
+		// durable receipt as newly queued enrichment, not another LLM pipeline.
+		return e.handleKnowledgeEnrich(ctx, j)
 	}
 	if options.Admission != nil {
 		callCtx, cancel := context.WithTimeout(ctx, options.Timeout)

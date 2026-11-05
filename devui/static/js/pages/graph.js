@@ -49,27 +49,30 @@ export default async function (root, [name]) {
   const prefix = h('input', { placeholder: 'filter by name prefix' });
   const list = h('div');
   const load = guard(async () => {
-    const { entities } = await call('GET', '/v1/entities?limit=100&prefix=' + encodeURIComponent(prefix.value));
-    list.replaceChildren(table([
+    const result = await call('GET', '/v1/entities?limit=100&prefix=' + encodeURIComponent(prefix.value));
+    const entities = result.entities ?? [];
+    list.replaceChildren(entities.length ? table([
       { label: 'entity', render: (e) => h('b', null, e.name) }, { label: 'type', render: (e) => (e.type ? badge(e.type) : '') },
       { label: 'mentions', key: 'mentions' }, { label: 'aliases', render: (e) => (e.aliases || []).join(', ') },
-    ], entities, (e) => (location.hash = '#/graph/' + encodeURIComponent(e.name))));
+    ], entities, (e) => (location.hash = '#/graph/' + encodeURIComponent(e.name))) : h('p', null, 'No entities found.'));
   });
   prefix.addEventListener('input', load);
   const canvas = h('canvas');
   const detail = h('div');
   page(root, 'Entity graph', 'Entities come from facts and rule patterns; memories mentioning the same entity form the graph used by entity retrieval and graph hops.',
+    h('p', null, h('a',{href:'#/documents'},'Explore documents, chunks, embeddings and revision lineage')),
     h('div', { class: 'grid2' },
       h('div', { class: 'card' }, h('div', { class: 'row' }, prefix), list),
       h('div', null, h('div', { class: 'card' }, canvas), detail)));
   await load();
   if (!name) return;
   const n = await call('GET', '/v1/entities/' + encodeURIComponent(name));
-  draw(canvas, n.entity, n.related, (pick) => (location.hash = '#/graph/' + encodeURIComponent(pick)));
+  draw(canvas, n.entity, n.related ?? [], (pick) => (location.hash = '#/graph/' + encodeURIComponent(pick)));
   detail.replaceChildren(h('div', { class: 'card' },
     h('h2', null, `${n.entity.name} · ${n.entity.mentions} mentions`),
-    table([
+    n.entity.type === 'document' ? h('a',{href:'#/documents/'+encodeURIComponent(n.entity.name)},'Open document entity and original file') : null,
+    (n.memories ?? []).length ? table([
       { label: 'memory', render: (m) => m.text }, { label: 'state', render: status },
       { label: 'id', render: (m) => h('span', { class: 'mono' }, short(m.id)) },
-    ], n.memories, (m) => (location.hash = '#/memory/' + m.id))));
+    ], n.memories, (m) => (location.hash = '#/memory/' + m.id)) : h('p', null, 'No current readable memories mention this entity.')));
 }

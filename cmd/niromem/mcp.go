@@ -1,67 +1,23 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	niromem "github.com/alexedtionweb/niro-memory"
 	"github.com/alexedtionweb/niro-memory/api"
 	"github.com/alexedtionweb/niro-memory/client"
-	"github.com/alexedtionweb/niro-memory/knowledge"
 	"github.com/alexedtionweb/niro-memory/mcp"
-	"github.com/alexedtionweb/niro-memory/memory"
-	"github.com/alexedtionweb/niro-memory/pipeline"
-	"github.com/alexedtionweb/niro-memory/search"
 )
 
-type mcpBackend struct {
-	engine *niromem.Engine
-	tenant string
-	as     memory.Principal
-}
+type mcpIdentity struct{ id api.Identity }
 
-func (b mcpBackend) EvaluateKnowledge(ctx context.Context, req niromem.KnowledgeRequest) (*niromem.KnowledgeResult, error) {
-	req.Input.Scope = memory.Scope{Tenant: b.tenant, User: b.as.User, Agent: b.as.Agent}
-	req.As, req.Input.Authority = b.as, false
-	return b.engine.EvaluateKnowledge(ctx, req)
-}
-
-func (b mcpBackend) KnowledgeState(ctx context.Context, req niromem.KnowledgeRequest) (knowledge.State, error) {
-	req.Input.Scope = memory.Scope{Tenant: b.tenant, User: b.as.User, Agent: b.as.Agent}
-	req.As, req.Input.Authority = b.as, false
-	return b.engine.KnowledgeState(ctx, req)
-}
-
-func (b mcpBackend) KnowledgeTrace(ctx context.Context, key string) (*niromem.KnowledgeResult, error) {
-	return b.engine.KnowledgeTrace(ctx, b.tenant, b.as, key)
-}
-
-func (b mcpBackend) Search(ctx context.Context, req client.SearchRequest) (*search.Result, error) {
-	req.Tenant, req.As = b.tenant, b.as
-	if req.Filter != nil {
-		raw, err := json.Marshal(req.Filter)
-		if err != nil {
-			return nil, err
-		}
-		f, err := memory.ParseFilter(raw)
-		if err != nil {
-			return nil, err
-		}
-		req.SearchRequest.Filter = memory.And(req.SearchRequest.Filter, f)
-	}
-	return b.engine.Search(ctx, req.SearchRequest)
-}
-
-func (b mcpBackend) Remember(ctx context.Context, facts ...niromem.Fact) ([]pipeline.Change, error) {
-	for i := range facts {
-		facts[i].Tenant = b.tenant
-	}
-	return b.engine.Remember(ctx, facts...)
+func (a mcpIdentity) Authenticate(*http.Request) (api.Identity, error) {
+	return a.id, nil
 }
 
 func mcpHandler(e *niromem.Engine, auth api.Authenticator, address, user, agent string) (http.Handler, error) {
@@ -82,12 +38,20 @@ func mcpHandler(e *niromem.Engine, auth api.Authenticator, address, user, agent 
 			return
 		}
 		p := id.Principal
-		if !p.Admin && ((p.User != "" && p.User != user) || (p.Agent != "" && p.Agent != agent)) {
-			http.Error(w, "API key binding does not match the configured MCP user/agent", http.StatusForbidden)
-			return
+		writeUser, writeAgent := user, agent
+		if !p.Admin {
+			if p.User != "" {
+				writeUser = p.User
+			}
+			if p.Agent != "" {
+				writeAgent = p.Agent
+			}
 		}
-		p.User, p.Agent, p.Admin = user, agent, false
-		s, err := mcp.New(mcpBackend{engine: e, tenant: id.Tenant, as: p}, user, agent)
+		// Reuse native API authorization with the already authenticated identity;
+		// never grant admin or accept a tenant selected by tool arguments.
+		backend := client.NewLocal((&api.Server{Engine: e, Auth: mcpIdentity{id}}).Handler())
+		backend.HTTP.Timeout = mcp.SearchTimeout + 5*time.Second
+		s, err := mcp.NewWorkspace(backend, writeUser, writeAgent)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

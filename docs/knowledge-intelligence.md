@@ -211,19 +211,87 @@ operation planner to reinterpret a whole input as one memory.
    episode/part evidence; cursor advancement, source writes and enrichment jobs
    are atomic. Structured-only/media-only parts still need a configured extractor;
    they are not silently presented as model-extracted text.
-3. The worker performs one bounded structured extraction, not separate calls
+3. The worker starts with one bounded structured extraction, not separate calls
    for each fact, entity, decision and relationship. Ollama runs with thinking
    disabled, CPU-only (`num_gpu: 0`), temperature zero, a constrained JSON schema,
-   four inference threads, 4096 context tokens, at most 700 output tokens and a
-   ten-minute keep-alive.
-   The example sets a 15-second per-request timeout. Other planner calls retain
-   their existing settings.
-4. At most four quoted claims and eight links are admitted. Sources over 6000
+   four inference threads, 4096 context tokens, initially 1200 output tokens and a
+   ten-minute keep-alive by default. Transition planning now also uses bounded
+   CPU generation (512 output tokens by default), rather than Ollama's unbounded
+   generation defaults. Both paths accept planner options `num_thread`, `num_ctx`
+   and `num_predict`; zero selects the defaults.
+   The provider protocol is model-independent: the server splits source text
+   into numbered, verbatim evidence spans of at most 2048 bytes. Models select
+   an `evidence_id` for each fact/entity rather than generating quotation text.
+   Ollama's constrained schema bounds the IDs; OpenAI-compatible requests carry
+   the same schema and examples in the prompt. The server resolves IDs back to
+   exact source text before running the unchanged grounding/type validators.
+   IDs never refer to neighboring candidates. Invalid IDs, conflicting quotes
+   and subject/object/entity names absent from the selected evidence are rejected.
+   Legacy verbatim-quote responses remain supported and fully validated.
+   This reduces copying/paraphrasing failures, not semantic hallucinations:
+   a valid evidence reference alone does not prove the predicate is correct.
+   The effective extraction profile's public schema still describes the resolved
+   quote-based result, while provider requests use this indexed-evidence schema.
+   When an extraction unit has no usable records because validation failed, the connector
+   makes at most one source-only correction with validation feedback within the same request deadline. It
+   records the rejected validation error in normalization notes, revalidates
+   every quote, and resolves deterministic polarity links against the original
+   candidate indexes. It also works without candidates, and does not
+   retry transport failures. Valid records with rejected optional annotations
+   are retained without another model call. This avoids repeating a noisy context without accepting
+   ungrounded output. A second invalid response still fails explicitly.
+   Incomplete generation (including truncated JSON and provider token-limit
+   finish reasons) is a retryable provider failure, not invalid source evidence.
+   An initially truncated Ollama extraction gets one immediate retry, doubling
+   its output budget up to 4096 tokens within the original request deadline.
+   It never repairs or accepts partial JSON; continued truncation remains a
+   durable job retry rather than an immediate permanent rejection.
+   Grounding is not semantic correctness: the small CPU model can still assign
+   an incorrect entity category or epistemic type, or miss a claim entirely.
+   A completed job is not proof of correct understanding. Inspect the returned
+   claims and unreviewed annotations, not just queue state or HTTP success.
+   The Qwen and LFM3-Omni structured examples start at 1536 output tokens.
+   Qwen allows twenty minutes per source extraction and LFM3-Omni ten
+   for cold loading and CPU inference. The provider HTTP
+   client and worker deadline do not impose shorter caps. Set
+   `knowledge.timeout_ms` (1..1800000) for your hardware; restart both server and
+   external workers after changing it. Original saves do not wait for inference.
+   Worker concurrency is configurable; begin with one on CPU-only machines.
+   Increasing it can queue multiple inference requests behind the local model.
+   On a two-core host,
+   set `num_thread` to 2. More workers can increase CPU contention rather than
+   throughput. These limits do not serialize other applications using Ollama.
+   Pending legacy `knowledge.evaluate` jobs use source-keyed enrichment when
+   background enrichment is enabled, sharing its durable receipt with newly
+   queued `knowledge.enrich` jobs instead of running the older planner again.
+   After restarting with the new configuration, retry dead jobs from Operations.
+   Retry reuses the same job ID instead of copying a second visible job; it resets
+   attempts/checkpoint. Pause/resume, cooperative cancellation, inactive deletion
+   and priority controls are documented in [Operations](./operations.md).
+   Invalid model output still fails explicitly; no invented
+   evidence is admitted just to make the queue look healthy.
+   The Dev UI disables manual worker passes while the inline worker is active;
+   the backend enforces this too, so pressing the button cannot bypass the CPU
+   concurrency limit. Without an inline worker, a manual pass claims one job,
+   not a large batch whose leases could expire before execution.
+4. Each model call admits at most four quoted claims, twelve named entities and
+   eight links. Independent evidence windows aggregate up to 64 claims and
+   320 entity annotations (including inline annotations), with at most eight candidate links.
+   Sources over 6000
    bytes fail explicitly, without losing the saved original. At most six recent
    current candidates (also bounded by the tenant candidate limit), each at most
    1000 bytes and 2000 bytes total text, are selected from a 64-row scoped window.
    This is a bounded context, **not an exhaustive semantic conflict search**.
-5. Quotes must exist verbatim in the saved source. Subjects/objects must occur
+5. Quotes must exist verbatim in the saved source. A model's final `.`/`!`
+   mismatch (including an added final punctuation mark absent at the end of the
+   source) may be aligned only to a unique otherwise-exact source span, with
+   the original model quote and the adjustment explicitly recorded in validation
+   notes. Questions, changed words and ambiguous matches are never repaired.
+   If a provider echoes an existing candidate as an extra claim, that exact
+   candidate quote is excluded with a validation note only when at least one
+   valid source-grounded claim remains. Unknown quotes, candidate-only outputs
+   and relationships referencing a discarded context claim are rejected.
+   Subjects/objects must occur
    in the quote; references, epistemic types and link types are validated.
    Explicit negation is stored as assertion condition `polarity: negative`;
    affirmative claims use `positive`. Exact unconditional structured claims
@@ -233,9 +301,10 @@ operation planner to reinterpret a whole input as one memory.
    and their present-tense forms) classify a generic model `fact` as a proposed
    decision. The model's original classification is retained as `model_type`.
    Other languages depend on the provider's epistemic classification.
-   Entity references preserve extracted names; they do not claim canonical
-   cross-language resolution or invented entity classes.
-6. The exact candidate snapshot and extraction are durably receipted before
+   Entity names and evidence must appear in the source; types and optional
+   attributes must satisfy the tenant profile. Types are model annotations,
+   not verified identities or canonical cross-language resolution.
+6. The exact candidate snapshot, extraction profile, output schema and extraction are durably receipted before
    application. Stable source-version IDs, operation keys and optimistic checks
    let another node resume without calling the model again or duplicating
    transitions. If evidence/context closes, the result requires review instead
@@ -245,6 +314,114 @@ operation planner to reinterpret a whole input as one memory.
    commit atomically. The original memory/assertion is never rewritten with a
    new interpretation. Dependency notifications remain part of the store
    transaction when supporting memories close.
+
+   #### Duplicate prevention and evidence
+
+   Background extraction reconciles canonical structured assertions instead of
+   unconditionally inserting a memory per source. Repeated equivalent assertions
+   produce an `evidence` change referring to the existing memory, an append-only
+   audit event and a source-specific `derived_from` edge. The original assertion,
+   quote, entity annotations, recording time and provenance are not rewritten.
+   Evidence sources remain separately inspectable: retaining an original source
+   and its interpreted assertion is intentional, not failed deduplication.
+   The Dev UI labels these cards **Original input** and **Model extraction**
+   (including the stored review status), rather than presenting identical text
+   as two indistinguishable saves. The extraction inspector links to its original
+   input and identifies the model. Neither record is hidden or deleted.
+   Browse uses a single-column list; the inspector occupies space only after
+   selection and can be closed without navigation. On narrow screens the
+   selected inspector appears above the list and receives keyboard focus.
+   To delete a memory, select it in **Browse**, then choose **Delete memory**
+   in the inspector and confirm permanent deletion. This deletes the selected
+   record, not all related memories. To retain a historical record instead,
+   open **Read evidence & version history** and choose **Invalidate**.
+   Search leads with a natural-language query; scope, historical filters and
+   scoring controls remain available under **Advanced search options**.
+   Retrieved memory text appears before collapsed retrieval diagnostics and
+   ranking scores; no generated explanation is substituted for stored evidence.
+   Empty search results and context sections serialize as empty arrays, not
+   `null`. The UI also accepts legacy `null` collections and displays the
+   no-matches state without JavaScript errors.
+   Entity graphs, memory history and workspace lists also accept legacy empty
+   collections. Entity neighborhoods return empty arrays for missing neighbors
+   and current readable memories.
+   After **Save now** confirms the original, controls are released immediately;
+   extraction-status and embedding-coverage checks do not block another save
+   through **Start over**. Failed writes retain their exact input and retry key.
+   Action rows wrap within their panels, and wide data tables scroll locally
+   rather than widening the page.
+
+   Identity includes owner/run scope, exact audience/grants, trust, epistemic type,
+   polarity, entity types/attributes and expiry. Casing/whitespace and terminal
+   punctuation are normalized; substantive words outside the triple retain the
+   whole quote as a conservative qualifier. Similarity or embeddings alone never
+   establish equivalence, and paraphrases with different predicates may remain
+   separate. Explicit world-validity starts are kept distinct. Ordinary
+   current-time observations can reinforce one another regardless of worker order;
+   the first committed interpretation retains its original validity/recording
+   times. Reinforcement does not backdate an assertion.
+
+   The matching-set absence check is enforced inside `store.Write(Batch)` on all
+   three primary stores. Concurrent workers cannot both insert the same open
+   identity; the losing worker retries its durable extraction snapshot. Evidence,
+   relationships, jobs and result are committed together with stable operation keys.
+   Closed/deleted assertions are never resurrected or mutated for reuse. Existing
+   records are not retrospectively merged or reclassified. Identity lookup uses
+   tenant-scoped indexed metadata filtering, not the small model candidate window.
+
+   #### Per-tenant extraction profile and generated JSON Schema
+
+   The default entity vocabulary is `person`, `organization`, `team`, `project`,
+   `service`, `technology`, `database`, `location`, `document`, `concept`, `event`
+   and `other`. All six epistemic claim types are enabled. Entities are extracted
+   using model-provided `subject_type`/`object_type` annotations on claims, avoiding
+   repeating the same evidence in the model output. Additional entities and optional
+   attributes use the `entities` array; configured properties can also be emitted
+   as `subject_attributes`/`object_attributes` directly on a claim. Both normalize to grounded typed entities in
+   the public result. An empty inline type denotes a non-named value. Common
+   English/Portuguese pronouns are excluded from entity indexes, with their original
+   model classification explained in `normalization_notes` and the UI. No entity
+   class is fabricated by normalization.
+   Entities can also be extracted independently of triples, including entity-only inputs. An entity not attached
+   to a claim receives an explicitly unreviewed `mentioned_as` observation, so it
+   is indexed and linked to its evidence without inventing a factual relationship.
+   Typed references are indexed; original type, quote and attribute annotations
+   also remain on the immutable interpretation and extraction receipt.
+
+   Tenant admins can open **Models & schemas -> Extraction schema**. The UI displays the actual
+   generated provider schema and duplicate reinforcement outcomes. Changes preserve
+   other tenant settings. Enable **Use server extraction defaults** to remove the
+   override. The equivalent API is `GET /v1/settings`, then modify
+   `knowledge.extraction` and `PUT /v1/settings` with the complete existing settings:
+
+   ```json
+   {
+     "entity_types": ["person", "organization", "project", "service", "technology", "database"],
+     "fact_types": ["fact", "observation", "belief", "hypothesis", "decision", "preference"],
+     "entity_attributes": {
+       "role": {"type": "string", "description": "Explicit role in the quoted text"},
+       "environment": {"type": "string", "enum": ["production", "staging", "development"]}
+     }
+   }
+   ```
+
+   Server defaults can be configured using the same profile at
+   `knowledge.extraction` in the CLI config, or `KnowledgeOptions.Extraction` in Go.
+   Omitted/null overrides inherit the server profile. Entity types must be 1..24
+   unique lowercase identifiers; claim types select 1..6 supported types. At most
+   eight optional entity attributes are allowed: `string`, `number` or `boolean`
+   (bounded string enums supported). Nested objects, arbitrary output structures,
+   unknown attributes and unsupported types are rejected. Attribute values and
+   entity classes are unreviewed model interpretations grounded by a source quote,
+   not independent deterministic verification of each inferred property.
+
+   The connector sends the generated JSON Schema to Ollama; OpenAI-compatible
+   providers keep `json_object` mode and receive that exact contract in their
+   instructions. Both paths use the same deterministic output validation.
+   Safety, quote grounding, sizes, evidence, reference indexes, owner/audience and
+   authority rules cannot be disabled by a tenant profile. Each plan snapshots its
+   profile/schema, so changing settings cannot reinterpret an already planned
+   retry. Disabled/shadow/enforced behavior is unchanged.
 
 `enforced` applies these **unreviewed annotations**, not authoritative corrections
 or retractions. Extracted decisions start as `proposed`. Confidence is a fixed
@@ -275,15 +452,182 @@ To reproduce a synthetic CPU quality/latency comparison against local Ollama:
 go run ./connectors/knowledge/testdata/cpu-benchmark.go qwen3:0.6b qwen3:1.7b > cpu-results.json
 ```
 
-Each model receives one separately reported warm-up and twenty measured requests
-covering a fact, a decision, a greeting and an explicit conflict with a structured
-existing assertion. The conflict score includes deterministic polarity matching;
+Each model receives one separately reported warm-up and thirty measured requests
+by default (six cases, five repetitions). Cases cover a fact, a decision, a
+greeting, an explicit conflict with a structured existing assertion, a repeated
+statement with punctuation differences and Portuguese people/organization names.
+Use `-repeats 2` before model names for a twelve-request check.
+The conflict score includes deterministic polarity matching;
 it is not a measure of model-only relationship inference. Output includes
-every response/error, schema/grounding validation count, simple case-pass count
-and nearest-rank p50/p95. These small synthetic samples are **not** production
+every response/error, schema/grounding validation count, simple case-pass count,
+expected named-entity presence checks and nearest-rank p50/p95. Entity presence
+checks do not measure exhaustive entity recall or classification accuracy.
+These small synthetic samples are **not** production
 accuracy or latency guarantees. Inspect actual claims; passing grounding checks
 does not establish semantic truth. A fast model returning empty arrays is not
 counted as successfully extracting a substantive claim.
+
+To check the real HTTP save/read-back path with a local Ollama model:
+
+```sh
+NIROMEM_TEST_LOCAL_EXTRACTION=1 go test -v ./connectors/knowledge \
+  -run '^TestLocalModelExtractionThroughAPI$' -count=1 -timeout 15m
+```
+
+This opt-in test defaults to `LiquidAI/lfm2.5-350m`; override it with
+`NIROMEM_TEST_EXTRACTION_MODEL`. It uses generated English and Portuguese
+fixtures, an isolated in-memory store and a temporary HTTP server, never the
+running application's database. It calls the real enrichment handler in
+extractive mode, requires exact source excerpts, and checks that no structured
+claims, entity annotations or graph links were invented. No UI tests are involved.
+
+The [text-only configuration](../configs/lfm2.5-350m.example.json) retains its
+historical filename but now uses **Qwen3.5:2B structured extraction** with
+`think:false`, `extractive_only:false`, `num_ctx:8192` and `num_predict:1536`.
+The provider deadline is 21 minutes and knowledge deadline 20 minutes for slow
+CPU inference. EmbeddingGemma remains separate. Grounding validation is not
+relaxed: invalid records are excluded with explicit issues, not invented
+assertions or an excerpt fallback. Valid sibling records remain usable.
+Tenant overrides can still narrow/replace the effective planner configuration.
+
+The opt-in `TestLocalQwenStructuredExtraction` checks real Qwen on generated
+English, Portuguese and Spanish statements. The end-to-end revision test uses
+the example models, a generated statement, temporary SQLite and the native API:
+
+```sh
+NIROMEM_TEST_LOCAL_EXTRACTION=1 NIROMEM_TEST_LOCAL_EMBEDDING=1 \
+  go test -v ./cmd/niromem -run '^TestLocalDocumentRevisionThroughAPI$' \
+  -count=1 -timeout 9m
+```
+
+It verifies a committed document revision, a grounded structured item, persisted
+768-dimensional vectors and source links. These tiny fixtures demonstrate the
+working path, not production extraction accuracy or exhaustive document recall.
+No application database or UI tests are involved. For larger sources, use
+[manual document revisions](./documents.md#manual-incremental-revisions) to
+recompute selected layers while retaining prior knowledge until atomic activation.
+
+Other providers/configurations may still opt into `extractive_only:true`.
+This mode works with Ollama and OpenAI-compatible endpoints without model-name
+special cases; it remains distinct from structured extraction.
+Provider `timeout_ms:0`
+or omission retains the 11-minute default; its allowed range is 0..1860000.
+Worker deadlines remain longer than the configured inference budget. These are
+maximum waits, not artificial delays.
+
+### Structured recovery and document coverage
+
+The structured prompt includes multilingual procedural rules, requirements,
+exclusions and thresholds, not just simple personal/project statements.
+Structured assertions are checked for numeric values omitted from their selected
+source quotes. A missing threshold, timeout or version triggers one focused
+correction naming the lost values, not another whole-document pass. Persistent
+loss is flagged as a window issue while other windows continue. This conservative
+check can also flag omitted numeric references; it does not verify predicates,
+comparison direction, units or general semantic completeness.
+
+Passages containing multiple evidence spans are processed in independent
+single-span windows, up to sixteen windows per passage. Each request remains bounded
+to four facts/twelve entity annotations; the resolved aggregate permits 64 facts
+and 320 entity annotations (including inferred inline annotations), with at most
+eight candidate links. Unprocessed overflow is explicitly reported as a coverage
+issue, never represented as complete extraction.
+
+Each fact, entity and relation is validated independently. Invalid optional
+entity typing/attributes can be excluded while retaining the grounded claim.
+Invalid entities do not erase valid facts; links to rejected claims are excluded
+and indexes are remapped. Every excluded record has an `issues` diagnostic.
+Only when an entire unit is unusable is a bounded validation-feedback retry
+attempted. Transport and truncated-output recovery retain their separate
+classification. Splitting, record isolation and durable targeted repair are the
+primary recovery mechanisms—not blind repetitions of a whole document.
+
+Background results distinguish `partial` (grounded output with review gaps),
+`empty` (model returned no structured records), `needs_review` and transport
+failure. Empty output does not establish that the source lacks knowledge.
+Document revisions can activate validated partial knowledge, expose the gaps,
+and queue one targeted repair round; see [document revisions](./documents.md).
+
+The opt-in `TestLocalQwenProceduralDocumentExtraction` checks generated Spanish
+passages with multiple exclusions, installation requirements, a session timeout,
+and signal/card thresholds. It asserts key details in the structured assertions,
+not just nonempty JSON. It is still a small sample, not a document-recall guarantee.
+
+### Optional excerpt-only extraction
+
+In excerpt-only mode, the server segments source text into numbered verbatim spans of at most 2048
+UTF-8 bytes. The model makes **one request** returning only `{"ids":[0,1]}`:
+up to four distinct source IDs, or `{"ids":[]}` when none are useful. No candidate
+memories, classification examples, entity vocabularies or relationship tasks are
+sent. Ollama receives a bounded JSON schema; compatible endpoints receive the
+same contract as instructions. The server validates the response and resolves
+IDs to exact source text in `extraction.excerpts`. Repeated identical source
+text is deduplicated. It never trusts model-written excerpts.
+
+For document source chunks, extractive mode now records **`source_only`** with
+an explicit reason, without invoking the selection model or creating duplicate
+memories. Section-aware passages and their headings already provide searchable
+source context. Deterministic document-section references are not inferred
+claims or a semantic entity graph. Structured/staged planners and non-document
+sources retain their existing contracts.
+
+For non-document sources, in enforced mode selected excerpts become ordinary text memories, through the
+existing ACL-preserving, deduplicating reconciler. Their metadata records source
+ID/version, source text/offsets and model provenance. They have no generated
+subject/predicate/object assertion, entity types, decision classification or
+graph relationships. Existing normal memory preparation still normalizes stored
+text; the extraction receipt retains the exact source slices. Matching existing
+text is reused rather than duplicated. Excerpt writes enqueue normal embeddings
+but do not recursively enqueue enrichment. In shadow mode excerpts are recorded
+without applying memory changes.
+
+Malformed/truncated model output, missing/null arrays, unknown fields, duplicate
+IDs and invalid references produce a durable **`needs_review`** receipt with an
+explicit error and warning log, not `completed` and not a dead job. No excerpts
+are committed from rejected output and no automatic model repair loop runs.
+The source version is checked before recording review. Retry of that queue job
+reuses the receipt instead of calling the model again. Transport errors and
+timeouts remain real errors with the existing durable retry behavior; they are
+not disguised as model review. Existing dead jobs/receipts are not automatically
+cleared or retried. Original storage and embedding jobs remain independent.
+
+This guarantees that accepted excerpts come from source text, **not** that every
+model selects the right sentences or that source statements are true. An empty
+selection is not a completeness guarantee. Local LFM2.5-350m checks selected the
+three generated English/Portuguese samples verbatim, but are not a production
+accuracy certification. Existing source-size and deadline limits still apply.
+
+### Legacy structured extraction
+
+`staged_extraction: true` remains available for structured-extraction experiments.
+It is mutually exclusive with `extractive_only`. Without either flag, the
+original structured single-call contract remains in effect.
+
+Staged extraction separates source-only claims, per-claim classification,
+source-only entities, and optional candidate relationships. Only the relationship
+stage receives candidate memories. Classification and entities cannot rewrite
+the extracted triples. When a claim omits an evidence ID, the server selects the
+first source span containing its subject, predicate and object; no matching
+source span is an error. Entities still select explicit evidence IDs.
+Stages use JSON generation with strict server-side field, type, evidence and
+reference validation, rather than one large constrained generation grammar.
+There are normally three calls for one claim without candidates, four with
+candidates; additional claims each require their own classification call.
+Empty claims skip classification and relationships, but still permit entity
+extraction. Each invalid or truncated stage gets at most one repair attempt;
+successful stages are not rerun. Repairs are recorded in extraction notes.
+Transport failures are not hidden by repairs, and rejected annotations never
+become a successful partial result. Only the complete normalized result can
+reach the enrichment commit; the original source remains intact on failure.
+All stages share the job's existing deadline and remain request-local/stateless.
+
+Local verification of `LiquidAI/lfm2.5-350m` failed the original full-contract
+checks. Staged trials improved the three sample claim triples, but classification
+and entity output still failed live checks. JSON contracts and source evidence
+references do not make this model's semantic extraction reliable. The example
+structured modes are not an accuracy certification; inspect outputs before using
+extracted assertions. `knowledge.mode: "shadow"` is available when evaluating
+an unverified model without committing its annotations.
 
 Local exploratory runs tested `gemma3:270m`, `smollm2:360m`, `qwen2.5:0.5b`,
 `qwen2.5:1.5b`, `qwen3:0.6b` and `qwen3:1.7b`. The smaller Gemma/SmolLM and
@@ -291,12 +635,21 @@ Qwen2.5 trials had frequent grounding/format failures; the larger Qwen trials
 were slower. Prompt/schema iterations were part of these trials, so they are
 not a controlled leaderboard.
 
-The selected four-thread `qwen3:0.6b` pipeline, measured without concurrent test
+The original pre-typed-profile four-thread `qwen3:0.6b` pipeline, measured without concurrent test
 execution on the local Core Ultra 7 165U CPU, produced:
 
 | Warm requests | Valid/grounded outputs | Synthetic case checks | p50 | p95 |
 |---|---|---|---|---|
 | 20 | 20/20 | 20/20 | 2395 ms | 3607 ms |
+
+With the typed profile, inline entity annotations and expanded six-case harness,
+a separate twelve-request run (`-repeats 2`) passed **12/12** schema/grounding,
+claim checks and expected named-entity presence checks: **3293 ms p50 /
+4403 ms p95**. Source text is sent separately from optional candidate context to
+reduce candidate copying by small models. This includes deterministic candidate-echo exclusion and polarity
+matching; it is not model-only accuracy. A separate local request verified a
+configured `role: engineer` attribute on the explicitly named person, not a
+fabricated default attribute.
 
 Separately, twenty new `/v1/facts` HTTP writes against the running SQLite server
 with background processing enabled measured **6.2 ms p50 / 8.2 ms p95** on
@@ -305,8 +658,9 @@ with a potential-conflict edge, and a proposed decision retaining the original
 model classification. All synthetic verification memories were then removed
 from their separate test tenant.
 
-The extraction samples are five repetitions of four small cases, not twenty independent knowledge
-domains. A simultaneous race-test workload caused timeouts in a separate run:
+The original extraction samples are five repetitions of four small cases, not twenty independent knowledge
+domains. The expanded harness adds two cases, not a production evaluation suite.
+A simultaneous race-test workload caused timeouts in a separate run:
 CPU contention, cold loading, longer sources, queue delay and model mistakes
 still matter. The architecture removes model latency from saving; it does not
 promise every enrichment completes within these observed percentiles.
@@ -338,12 +692,34 @@ go run -tags devui ./cmd/niromem serve -dev-ui -mcp -mcp-user my-project
 Open `http://localhost:8080/_dev/`. Existing admin authentication, API key
 selection and tenant isolation apply to every knowledge request.
 
-| Workspace | Real backend data and actions |
+The console has three primary screens. HTMX loads authenticated, server-rendered
+workspace fragments; existing JavaScript inspector modules keep using the real
+JSON APIs. HTMX 2.0.8 and Pico CSS 2.1.1 are served locally with their licenses:
+there are no CDN requests, inline scripts, or relaxed CSP requirements. Unknown
+routes are rejected before importing modules; old bookmarks redirect to the
+appropriate screen and preserve focused memory/turn identifiers.
+
+| Screen | Real backend data and actions |
 |---|---|
-| Memories (`#/explorer`) | Cards-first browsing, selected-memory history and connections. Older versions, the bounded graph and model diagnostics are optional. |
-| What is known? (`#/knowledge-state`) | Project/topic search with readable cards; expand dates or advanced filters for historical and exact-match queries. |
-| Saved result (`#/transitions`) | Plain-language outcome for an exact operation key, suggested actions and changed-memory links. Technical validation/proposal/receipt details are collapsed. |
-| Try a memory (`#/intelligence`) | Background mode: save original → follow extraction → inspect claims/connections. Advanced transition preview/confirmation remains available. JSON, settings and retry keys are under Advanced. |
+| Memories (`#/workspace`) | Browse cards, Remember, Search and Timeline. More tools includes knowledge state, exact transition receipts, entity graph and memory details. History and relationships stay connected to each memory. |
+| Models & schemas (`#/models`) | Embeddings: actual active query model, dimensions, stored-vector coverage, durable backfill and embedding-job errors. Extraction schema: visible effective profile, editable entity types/attributes and the exact generated JSON Schema. Tenant settings remain available. |
+| Operations (`#/operations`) | Jobs, metrics and read-only SQL. More tools retains rules, conversations and low-level ingestion/browsing. |
+
+Use **Models & schemas -> Embeddings -> Embed existing memories** to enqueue
+missing vectors for the configured embedder. Coverage refreshes while work is
+outstanding; failed enqueue, provider, authorization and coverage requests remain
+explicit. The worker must be running (the supplied Qwen config enables it inline).
+Backfill does not change assertions or historical evidence. The active query
+model includes the implicit server embedder, not just tenant model overrides.
+
+The basic command without `-config` does not configure Ollama or an embedder.
+For local model extraction and semantic search, start with
+`-config configs/qwen3.example.json`. A tenant's saved `enforced` mode cannot
+create a provider that was not configured at startup.
+
+**Include older versions** also reveals expired memories within the loaded
+slice. Timeline requests include expired history. Neither action restores,
+rewrites or deletes records.
 
 ### Preview, validate and commit
 

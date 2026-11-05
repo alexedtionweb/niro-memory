@@ -38,6 +38,7 @@ func Run(t *testing.T, newStore Factory) {
 		fn   func(*testing.T, store.Store)
 	}{
 		{"TenantIsolation", testIsolation},
+		{"TenantPurge", testTenantPurge},
 		{"AtomicBatch", testAtomic},
 		{"Slots", testSlots},
 		{"Temporal", testTemporal},
@@ -51,11 +52,18 @@ func Run(t *testing.T, newStore Factory) {
 		{"Settings", testSettings},
 		{"Lexical", testLexical},
 		{"Vectors", testVectors},
+		{"TargetVectors", testTargetVectors},
 		{"Jobs", testJobs},
+		{"JobControls", testJobControls},
+		{"JobPriority", testJobPriority},
+		{"JobControlRace", testJobControlRace},
+		{"JobYield", testJobYield},
+		{"JobPurgeFence", testJobPurgeFence},
 		{"ConcurrentSlotWrites", testConcurrentSlots},
 		{"Operations", testOperations},
 		{"RelationHistory", testRelationHistory},
 		{"KnowledgeChecks", testKnowledgeChecks},
+		{"ConcurrentNoMatchChecks", testNoMatchChecks},
 		{"KnownBeforeClosure", testKnownBeforeClosure},
 		{"ReceiptPrivacy", testReceiptPrivacy},
 		{"RelationCloses", testRelationCloses},
@@ -72,6 +80,55 @@ func Run(t *testing.T, newStore Factory) {
 }
 
 var ctx = context.Background()
+
+func testNoMatchChecks(t *testing.T, s store.Store) {
+	first := mem("reservation", "one")
+	first.Metadata = map[string]any{"identity": "same"}
+	first.Entities = []memory.EntityRef{{Name: "Atlas", Type: "project"}}
+	filter := memory.Eq("metadata.identity", "same")
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			m := first
+			m.ID = memory.NewID()
+			_, err := s.Write(ctx, &store.Batch{Tenant: "reservation", Memories: []memory.Memory{m}, Checks: []store.Check{{NoMatch: &filter}}})
+			results <- err
+		}()
+	}
+	close(start)
+	success, conflicts := 0, 0
+	for i := 0; i < 2; i++ {
+		err := <-results
+		if err == nil {
+			success++
+		} else if errors.Is(err, memory.ErrConflict) {
+			conflicts++
+		} else {
+			t.Fatal(err)
+		}
+	}
+	if success != 1 || conflicts != 1 {
+		t.Fatalf("set reservation raced: %d successes, %d conflicts", success, conflicts)
+	}
+	ms, err := s.Find(ctx, store.Query{Tenant: "reservation", AllVersions: true})
+	if err != nil || len(ms) != 1 {
+		t.Fatalf("partial conditional transaction: %+v %v", ms, err)
+	}
+	entityFilter := memory.Eq("entities", "Atlas")
+	if _, err := s.Write(ctx, &store.Batch{Tenant: "reservation", Checks: []store.Check{{NoMatch: &entityFilter}}}); !errors.Is(err, memory.ErrConflict) {
+		t.Fatalf("entity-set check inconsistent with reads: %v", err)
+	}
+	other := first
+	other.ID = memory.NewID()
+	other.Tenant = "other"
+	write(t, s, &store.Batch{Tenant: "other", Memories: []memory.Memory{other}, Checks: []store.Check{{NoMatch: &filter}}})
+	bad := memory.Filter{Field: "metadata.bad.path", Op: memory.OpEq, Value: "bad"}
+	if _, err := s.Write(ctx, &store.Batch{Tenant: "reservation", Checks: []store.Check{{NoMatch: &bad}}}); !errors.Is(err, memory.ErrInvalid) {
+		t.Fatalf("unchecked set filter: %v", err)
+	}
+}
 
 // base is a millisecond-truncated reference time; stores may round to ms.
 var base = time.Now().UTC().Truncate(time.Millisecond).Add(-24 * time.Hour)
@@ -623,9 +680,13 @@ func testVectors(t *testing.T, s store.Store) {
 		t.Fatalf("coverage %d/%d", have, total)
 	}
 	d := mem("t", "d")
-	write(t, s, &store.Batch{Tenant: "t", Memories: []memory.Memory{d}})
+	manifest := mem("t", "document-root", func(m *memory.Memory) { m.Source.Kind = "document_manifest" })
+	write(t, s, &store.Batch{Tenant: "t", Memories: []memory.Memory{d, manifest}})
 	if miss, _ := vc.Missing(ctx, "t", "m", 10); len(miss) != 1 || miss[0].ID != d.ID {
 		t.Fatalf("Missing: %+v", miss)
+	}
+	if have, total, err := vc.Coverage(ctx, "t", "m"); err != nil || have != 3 || total != 4 {
+		t.Fatalf("manifest inflated coverage: %d/%d %v", have, total, err)
 	}
 	if idx, ok := s.(vector.Index); ok {
 		hits, err := idx.Search(ctx, vector.Query{Tenant: "t", Model: "m", Values: []float32{1, 0, 0}, K: 2})

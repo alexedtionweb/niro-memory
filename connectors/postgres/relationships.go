@@ -10,6 +10,7 @@ import (
 	"github.com/alexedtionweb/niro-memory/memory"
 	"github.com/alexedtionweb/niro-memory/relations"
 	"github.com/alexedtionweb/niro-memory/store"
+	"github.com/alexedtionweb/niro-memory/store/sqlgen"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -65,6 +66,26 @@ func (w *writer) checkBatch(b *store.Batch) error {
 		return fmt.Errorf("%w: batch cannot be encoded: %v", memory.ErrInvalid, err)
 	}
 	for _, c := range b.Checks {
+		if c.NoMatch != nil {
+			f := *c.NoMatch
+			if err := f.Check(); err != nil {
+				return err
+			}
+			builder := sqlgen.Builder{D: dialect{}}
+			tenant := builder.Arg(w.t)
+			where, err := builder.Where(f)
+			if err != nil {
+				return err
+			}
+			var exists bool
+			if err := w.tx.QueryRow(w.ctx, `SELECT EXISTS(SELECT 1 FROM memories m WHERE m.tenant = `+tenant+` AND `+where+`)`, builder.Args...).Scan(&exists); err != nil {
+				return err
+			}
+			if exists {
+				return conflict("memory set changed")
+			}
+			continue
+		}
 		var version int
 		var open bool
 		err := w.tx.QueryRow(w.ctx, `SELECT version,valid_to IS NULL AND invalidated_at IS NULL FROM memories WHERE tenant=$1 AND id=$2 FOR UPDATE`, w.t, c.ID).Scan(&version, &open)

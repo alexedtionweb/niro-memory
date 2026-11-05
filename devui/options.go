@@ -21,4 +21,6 @@ type Options struct {
 	Engine  *niromem.Engine
 	Auth    api.Authenticator
 	Metrics *metrics.Registry
+	// InlineWorker prevents manual passes from starting competing workers.
+	InlineWorker bool
 }

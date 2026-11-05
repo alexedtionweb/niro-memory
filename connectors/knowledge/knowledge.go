@@ -34,7 +34,15 @@ type Options struct {
 	Model    string
 	// Think controls Ollama reasoning. Nil preserves the model's default.
 	Think *bool
-	HTTP  *http.Client
+	// Ollama generation limits. Zero uses CPU-first defaults.
+	NumThread  int
+	NumCtx     int
+	NumPredict int
+	// StagedExtraction separates claims, classification, entities and relations.
+	// It is provider/model independent and affects enrichment only, not planning.
+	StagedExtraction bool
+	ExtractiveOnly   bool
+	HTTP             *http.Client
 }
 
 // Connector proposes plans only. It never calls tools or writes to storage.
@@ -49,8 +57,22 @@ func (c *Connector) KnowledgeProvider() (string, string) {
 	return c.options.Protocol, c.options.Model
 }
 
+// KnowledgeExtractionMode reports the active enrichment contract.
+func (c *Connector) KnowledgeExtractionMode() string {
+	if c.options.ExtractiveOnly {
+		return "extractive"
+	}
+	if c.options.StagedExtraction {
+		return "staged"
+	}
+	return "structured"
+}
+
 // New validates configuration without making a network request.
 func New(options Options) (*Connector, error) {
+	if options.ExtractiveOnly && options.StagedExtraction {
+		return nil, errors.New("knowledge: extractive_only and staged_extraction are mutually exclusive")
+	}
 	options.Protocol = strings.ToLower(strings.TrimSpace(options.Protocol))
 	options.BaseURL = strings.TrimRight(strings.TrimSpace(options.BaseURL), "/")
 	if options.Protocol != ProtocolOpenAI && options.Protocol != ProtocolOllama {
@@ -58,6 +80,10 @@ func New(options Options) (*Connector, error) {
 	}
 	if options.BaseURL == "" || options.Model == "" {
 		return nil, errors.New("knowledge: base URL and model are required")
+	}
+	if options.NumThread < 0 || options.NumThread > 256 || options.NumCtx < 0 ||
+		options.NumCtx > 32768 || options.NumPredict < 0 || options.NumPredict > 4096 {
+		return nil, errors.New("knowledge: invalid Ollama generation limits (threads 0..256, context 0..32768, output 0..4096)")
 	}
 	if options.HTTP == nil {
 		options.HTTP = &http.Client{Timeout: 45 * time.Second}
@@ -191,6 +217,7 @@ For other operations requiring a target, copy the target's exact id and version 
 	}
 	payload := map[string]any{
 		"model": c.options.Model, "messages": messages, "stream": false, "format": "json",
+		"keep_alive": "10m", "options": c.ollamaOptions(512),
 	}
 	if c.options.Think != nil {
 		payload["think"] = *c.options.Think
@@ -198,11 +225,34 @@ For other operations requiring a target, copy the target's exact id and version 
 	return json.Marshal(payload)
 }
 
+func (c *Connector) ollamaOptions(output int) map[string]any {
+	threads, contextTokens := c.options.NumThread, c.options.NumCtx
+	if threads == 0 {
+		threads = 4
+	}
+	if contextTokens == 0 {
+		contextTokens = 4096
+	}
+	if c.options.NumPredict > 0 {
+		output = c.options.NumPredict
+	}
+	return map[string]any{"temperature": 0, "num_predict": output, "num_ctx": contextTokens, "num_gpu": 0, "num_thread": threads}
+}
+
+// An incomplete generation is retryable, not invalid source evidence.
+type incompleteOutput struct{ reason string }
+
+func (e *incompleteOutput) Error() string {
+	return fmt.Sprintf("knowledge: incomplete model output (%s); check generation token/context limits", e.reason)
+}
+func (e *incompleteOutput) Temporary() bool { return true }
+
 func (c *Connector) responseContent(body []byte) ([]byte, error) {
 	if c.options.Protocol == ProtocolOpenAI {
 		var response struct {
 			Choices []struct {
-				Message struct {
+				FinishReason string `json:"finish_reason"`
+				Message      struct {
 					Content string `json:"content"`
 				} `json:"message"`
 			} `json:"choices"`
@@ -210,18 +260,26 @@ func (c *Connector) responseContent(body []byte) ([]byte, error) {
 		if err := json.Unmarshal(body, &response); err != nil {
 			return nil, fmt.Errorf("knowledge: invalid OpenAI-compatible response: %w", err)
 		}
+		if len(response.Choices) == 1 && response.Choices[0].FinishReason == "length" {
+			return nil, &incompleteOutput{reason: "provider reached output token limit"}
+		}
 		if len(response.Choices) != 1 || strings.TrimSpace(response.Choices[0].Message.Content) == "" {
 			return nil, errors.New("knowledge: provider returned no single plan response")
 		}
 		return []byte(response.Choices[0].Message.Content), nil
 	}
 	var response struct {
-		Message struct {
+		Done       *bool  `json:"done"`
+		DoneReason string `json:"done_reason"`
+		Message    struct {
 			Content string `json:"content"`
 		} `json:"message"`
 	}
 	if err := json.Unmarshal(body, &response); err != nil {
 		return nil, fmt.Errorf("knowledge: invalid Ollama response: %w", err)
+	}
+	if response.Done != nil && !*response.Done || response.DoneReason != "" && response.DoneReason != "stop" {
+		return nil, &incompleteOutput{reason: "Ollama did not complete generation: " + response.DoneReason}
 	}
 	if strings.TrimSpace(response.Message.Content) == "" {
 		return nil, errors.New("knowledge: provider returned empty plan response")

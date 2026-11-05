@@ -154,7 +154,7 @@ func serve(ctx context.Context, log *slog.Logger, args []string) error {
 		}
 		mux := http.NewServeMux()
 		mux.Handle("/", handler)
-		mux.Handle("/_dev/", devui.Handler(devui.Options{Engine: e, Auth: auth, Metrics: reg}))
+		mux.Handle("/_dev/", devui.Handler(devui.Options{Engine: e, Auth: auth, Metrics: reg, InlineWorker: cfg.Worker.Inline}))
 		handler = mux
 		log.Info("development console enabled", "url", "http://"+cfg.Listen+"/_dev/")
 	}

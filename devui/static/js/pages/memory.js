@@ -2,6 +2,7 @@
 // lifecycle history and actions (correct, invalidate, delete).
 import { state, call, h, page, table, short, status, badge, pre, date, guard, toast } from '../lib.js';
 import { inspectEnrichment, workspaceSession } from '../knowledge-ui.js';
+import { filePreview } from '../file-preview.js';
 
 const NS = 'http://www.w3.org/2000/svg';
 const svg = (tag, attrs, ...kids) => {
@@ -16,7 +17,7 @@ const svg = (tag, attrs, ...kids) => {
 function timeline(versions) {
   const now = Date.now();
   const t = (s) => (s ? new Date(s).getTime() : now);
-  const min = Math.min(...versions.map((v) => t(v.valid_from), now));
+  const min = Math.min(now, ...versions.map((v) => t(v.valid_from)));
   const max = Math.max(now, ...versions.map((v) => t(v.valid_to)));
   const W = 760, X0 = 150, row = 26, span = Math.max(max - min, 1);
   const x = (ms) => X0 + ((ms - min) / span) * (W - X0 - 10);
@@ -37,22 +38,40 @@ function timeline(versions) {
 export default async function (root, [id]) {
   const active = workspaceSession(root);
   const m = await call('GET', '/v1/memories/' + id);
-  const [{ versions }, { events }] = await Promise.all([
+  if (!active()) return;
+  const [versionResult, historyResult] = await Promise.all([
     call('GET', `/v1/memories/${id}/versions`), call('GET', `/v1/memories/${id}/history`)]);
+  const versions = versionResult.versions ?? [], events = historyResult.events ?? [];
   const edit = h('textarea', { rows: 3 });
   edit.value = m.text;
   const reload = () => (location.hash = '#/memory/' + id + '?' + Date.now());
   const correct = guard(async () => {
+    if (!active()) return;
     const n = await call('PATCH', '/v1/memories/' + id, { text: edit.value, reason: 'corrected in dev console' });
+    if (!active()) return;
     toast('New version v' + n.version);
     location.hash = '#/memory/' + n.id;
   });
-  const invalidate = guard(async () => { await call('POST', `/v1/memories/${id}/invalidate`, { reason: 'dev console' }); toast('Invalidated'); reload(); });
+  const invalidate = guard(async () => {
+    if (!active()) return;
+    await call('POST', `/v1/memories/${id}/invalidate`, { reason: 'dev console' });
+    if (active()) { toast('Invalidated'); reload(); }
+  });
   const del = guard(async () => {
+    if (!active()) return;
     if (!confirm('Delete permanently? History keeps only the audit trail.')) return;
-    await call('DELETE', '/v1/memories/' + id); toast('Deleted'); location.hash = '#/memories';
+    await call('DELETE', '/v1/memories/' + id);
+    if (active()) { toast('Deleted'); location.hash = '#/memories'; }
   });
   const src = m.source || {};
+  const documentID = m.metadata?.document_id;
+  const documentSource = documentID ? h('section', { class: 'card' }, h('h2', null, 'Original document'),
+    h('a', { href: '#/documents/' + encodeURIComponent(documentID) + (m.metadata?.revision_id ? '/' + encodeURIComponent(m.metadata.revision_id) : '') }, 'Open document, revision and provenance graph'),
+    filePreview({ id: documentID, name: m.metadata?.filename || 'Original document' }, active)) :
+    m.metadata?.enrichment?.source_id ? h('p', { class: 'card' }, h('button', { onclick: guard(async () => {
+      const source = await call('GET', '/v1/memories/' + encodeURIComponent(m.id) + '/document');
+      if (active()) location.hash = '#/documents/' + encodeURIComponent(source.document_id);
+    }) }, 'Trace original document')) : null;
   const enrichment = h('div');
   if (!active()) return;
   page(root, m.title || 'Memory ' + short(m.id), null,
@@ -60,6 +79,9 @@ export default async function (root, [id]) {
       h('a', { href: '#/knowledge-state/' + encodeURIComponent(m.id) }, 'Inspect knowledge state'),
       h('a', { href: '#/intelligence/' + encodeURIComponent(m.id) }, 'Propose transition')),
     enrichment,
+    documentSource,
+    m.source?.kind === 'media_interpreted' ? h('p', { class: 'card' }, 'Unreviewed media interpretation. This description/transcript is model-generated, not a verified observation. Model: ', m.source.derived_by,
+      '. Original media is retained under Remember → Refresh media imports.') : null,
     h('div', { class: 'grid2' },
       h('div', { class: 'card' },
         h('p', null, status(m), badge(m.kind), badge('L' + m.layer), badge(m.visibility), badge('trust ' + src.trust, src.trust === 'low' ? 'warn' : ''),
@@ -73,7 +95,7 @@ export default async function (root, [id]) {
           h('div', null, 'valid'), h('div', null, date(m.valid_from), ' → ', m.valid_to ? date(m.valid_to) : 'open'),
           h('div', null, 'recorded'), h('div', null, date(m.recorded_at), m.invalidated_at ? ' · invalidated ' + date(m.invalidated_at) : ''),
           h('div', null, 'expires'), h('div', null, m.expires_at ? date(m.expires_at) : '—'),
-          h('div', null, 'confidence / importance'), h('div', null, `${m.confidence} / ${m.importance} · heat ${m.heat}`),
+          h('div', null, 'confidence / importance'), h('div', null, `${m.source?.kind === 'media_interpreted' ? 'unassessed' : m.confidence} / ${m.importance} · heat ${m.heat}`),
           h('div', null, 'tags'), h('div', null, (m.tags || []).map((t) => badge(t))),
           h('div', null, 'entities'), h('div', null, (m.entities || []).map((e) => h('a', { href: '#/graph/' + encodeURIComponent(e.name) }, badge(e.name + (e.type ? ' · ' + e.type : ''))))),
           h('div', null, 'source'), h('div', null, `${src.kind}${src.actor ? ' by ' + src.actor : ''}${src.role ? ' (' + src.role + ')' : ''}`, h('div', { class: 'mono muted' }, src.derived_by || '')),

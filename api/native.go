@@ -16,6 +16,8 @@ import (
 func (s *Server) native(mux *http.ServeMux) {
 	e := s.Engine
 	s.knowledge(mux)
+	s.maintenance(mux)
+	s.jobs(mux)
 	s.route(mux, "GET /v1/explore", func(w http.ResponseWriter, r *http.Request) error {
 		id := identity(r)
 		u, a, err := scope(id, r.URL.Query().Get("user_id"), r.URL.Query().Get("agent_id"))
@@ -23,7 +25,8 @@ func (s *Server) native(mux *http.ServeMux) {
 			return err
 		}
 		result, err := e.Explore(r.Context(), niromem.ListRequest{Tenant: id.Tenant, As: principal(id, u, a), User: u, Agent: a,
-			AllVersions: qBool(r, "all_versions"), Limit: qInt(r, "limit", 100), Offset: qInt(r, "offset", 0)})
+			AllVersions: qBool(r, "all_versions"), ShowExpired: qBool(r, "show_expired"),
+			Limit: qInt(r, "limit", 100), Offset: qInt(r, "offset", 0), BeforeID: r.URL.Query().Get("before_id")})
 		if err != nil {
 			return err
 		}
@@ -90,7 +93,7 @@ func (s *Server) native(mux *http.ServeMux) {
 		}
 		lr := niromem.ListRequest{Tenant: id.Tenant, As: principal(id, u, a), User: u, Agent: a, Run: q.Get("run_id"), Filter: f,
 			AllVersions: qBool(r, "all_versions"), ShowExpired: qBool(r, "show_expired"), Order: store.Order(q.Get("order")),
-			Limit: qInt(r, "limit", 50), Offset: qInt(r, "offset", 0)}
+			Limit: qInt(r, "limit", 50), Offset: qInt(r, "offset", 0), BeforeID: q.Get("before_id")}
 		if lr.ValidAt, err = qTime(r, "valid_at"); err != nil {
 			return err
 		}

@@ -30,6 +30,8 @@ niromem gives an agent durable, searchable, versioned memory without putting an 
 | Bi-temporal | Each fact has a validity window (`ValidFrom`/`ValidTo`) and an invalidation time for corrections. |
 | Conversation history | Turns and multimodal parts stored per run, with summaries and a sliding window. |
 | Durable background work | Extraction, embedding and backfill run through a leased job queue. |
+| Document import | PDF, scanned PDF (local OCR), TXT, Markdown and DOCX through an optional separate Go module. |
+| Multimodal memory | Optional local image, audio and short-video interpretation, retaining originals and unreviewed model provenance. |
 | Optional knowledge intelligence | Structured assertions, validated transitions, typed relationships, durable idempotency and dependency review. Disabled by default. |
 | Multi-tenant | Tenant is a hard isolation boundary enforced on every query. |
 | Pluggable backends | SQLite, PostgreSQL (pgvector), Qdrant, Redis, S3, or your own. |
@@ -37,7 +39,8 @@ niromem gives an agent durable, searchable, versioned memory without putting an 
 
 Use it when an agent needs to remember facts across sessions (preferences, decisions, conventions, profile data), and you want the recall to be fast, auditable and correctable.
 
-It is not a general document search engine. Semantic interpretation is optional:
+Document import preserves originals and creates searchable, source-linked chunks;
+it is not a full document-management system. Semantic interpretation is optional:
 configure your own planner rather than putting an LLM on the retrieval path.
 See [knowledge intelligence](docs/knowledge-intelligence.md) for atomic transitions,
 historical queries, providers, HTTP/MCP inspection and configuration.
@@ -68,15 +71,18 @@ Without `-config`, the CLI uses a durable `./niromem.db`, development authentica
 
 #### Inspect and exercise knowledge intelligence
 
-Open `http://localhost:8080/_dev/#/intelligence`. The workspace includes:
+Open `http://localhost:8080/_dev/`. The responsive HTMX + Pico CSS workspace has
+three primary screens (both libraries are served locally, without a CDN):
 
-- **Memories:** readable cards first; select one to see its connections and history. The graph is optional.
-- **Try a memory:** with background enrichment enabled, click **Save now** to persist the original immediately, then follow extraction progress and inspect the resulting claims and connections. The advanced transition preview/confirmation workflow remains available.
-- **What is known?:** find memories by project or topic; expand date controls to explore the past.
-- **Saved result:** see clearly whether an attempt was only previewed, recorded as a test, or applied.
+- **Memories:** browse cards, Remember, Search and Timeline. Use Remember's **Save now** for immediate persistence and background extraction. More tools retains knowledge state, transition receipts and entity relationships.
+- **Models & schemas:** actual embedding coverage and active query model, **Embed existing memories**, a directly visible **Extraction schema** editor and generated JSON Schema, and tenant settings.
+- **Operations:** background jobs, metrics, read-only SQL and the remaining advanced tools.
 
 JSON, evidence fields, provider settings, retry keys and raw responses are under
-**Advanced**. The other debugging pages remain under **Developer tools**.
+**Advanced** or the relevant screen's **More tools** menu. Existing deep links
+remain supported. Connection settings retain the existing API-key and tenant
+selection; authenticated HTML fragments use the same admin authorization as the
+development API.
 
 With `-dev-ui`, admins can change the authenticated tenant's mode and switch
 between registered provider profiles at runtime, even when startup mode is
@@ -102,9 +108,71 @@ saves and processed conversation text schedule grounded extraction transactional
 Extracted facts carry named entities, evidence, decision classifications and
 optional typed connections/conflict annotations. They are **unreviewed model
 interpretations**, not automatic corrections to previous assertions.
+Repeated equivalent extracted assertions reinforce existing memories with
+append-only evidence instead of creating duplicates, including across workers.
+Tenant admins can customize entity types and optional attributes under
+**Advanced: model & settings -> Extraction** (or `knowledge.extraction` in
+`/v1/settings`); the UI shows the generated JSON Schema, typed entities and
+reinforcement outcomes. Defaults cover twelve entity categories.
 Set `knowledge.mode` to `shadow` to keep originals but only inspect extraction
 suggestions; `disabled` pauses extraction without blocking explicit saves.
 See [the enrichment contract and CPU benchmark](docs/knowledge-intelligence.md#cpu-first-background-enrichment).
+
+#### Import documents
+
+In **Remember -> Import documents**, select one or several PDFs, text files,
+Markdown files or DOCX files and choose **Import documents**. Uploads return
+without waiting for parsing or models. Watch actual queued/processing/ingested
+status, inspect the resulting chunks, or download the original.
+
+The [documents connector](connectors/documents) is a separate Go module used by
+the existing API and durable worker. Enable it with:
+
+```json
+{
+  "blob": {"use": "dir", "dir": {"path": "blobs"}},
+  "documents": {"enabled": true, "concurrency": 2}
+}
+```
+
+The CPU example configuration already includes these settings. PDF processing
+needs Poppler; scans additionally need Tesseract installed on **each worker**:
+
+```sh
+sudo apt-get install poppler-utils tesseract-ocr
+```
+
+No external document or OCR service is used. Importing uses two upload lanes
+and bounded parallel OCR (default two pages). Embeddings use the existing
+batched jobs; keep model-worker concurrency low on CPU-only hardware.
+See [document ingestion](docs/documents.md) for limits, provenance, API and retry
+semantics. Restart the server to load connector/configuration and embedded UI changes.
+
+#### Multimodal memory
+For multimodal memory with local **LFM3-Omni**, run:
+
+```sh
+go run -tags devui ./cmd/niromem serve -dev-ui -mcp -mcp-user my-project -config configs/lfm3-omni.example.json
+```
+
+Use **Remember -> Remember images, audio & video**. Native FFmpeg handles
+bounded audio/video conversion; no Python is required. Originals remain as
+evidence, while searchable model interpretations are explicitly unreviewed.
+See [multimodal memory](docs/multimodal.md) for supported formats, video sampling,
+limitations, dependencies and API.
+
+#### Jobs and total cleanup
+
+**Operations -> Jobs** supports pause/resume, retry without duplicate job rows,
+cooperative cancellation, deleting inactive jobs and priority (-100..100).
+Inspect due time, lease and last error when a job appears stuck. CPU examples
+allow ten minutes per knowledge request; restart server/workers to apply this.
+
+**Memories -> Browse -> Danger zone: delete everything** wipes the entire current
+tenant, including originals, conversations, jobs and tenant settings. It requires
+typing the exact tenant name plus final confirmation. Cleanup is durable and
+batched; it is not a browser loop or instantaneous Redis `FLUSHDB`.
+See [operations and scale limits](docs/operations.md).
 
 ### 2.2 Connect Claude Code
 
@@ -129,13 +197,14 @@ Expect `ok` from health and `"isError":false` from search. An empty hit list is 
 
 ### 2.3 Talk to it through Claude
 
-The MCP server exposes two core tools. Claude calls them when you ask.
-Knowledge-capable backends also expose read-only inspection, explanation and
-dry-run proposal tools; see [knowledge intelligence](docs/knowledge-intelligence.md).
+The MCP server exposes the authenticated workspace: memories, history,
+knowledge/graph inspection, file ingestion, jobs, embeddings and tenant
+administration. See the [tool catalogue and confirmation rules](docs/mcp.md).
+Claude calls tools when you ask; access follows the same API identity as the UI.
 
 | Tool | Arguments | Behavior |
 | --- | --- | --- |
-| `search_memory` | `query` (required, at most 8000 bytes) | Returns up to 8 hits. Read-only. |
+| `search_memory` | `query` (required, at most 8000 bytes), optional `policy`, `limit`, scope and filters | Returns up to 100 hits (default 10), with retrieval trace. Read-only. |
 | `remember_memory` | `text` (required, at most 8000 bytes), `slot` (optional, at most 200 bytes) | Saves a durable fact. A `slot` replaces that property's previous value through versioned reconciliation. |
 
 Example requests:
@@ -308,10 +377,10 @@ Search combines relevance signals and priors, driven by a `search.Policy`. Polic
 
 | Policy | Intent | Waits for query embedding |
 | --- | --- | --- |
-| `default` | Balance of quality and latency | up to 50 ms |
+| `default` | Balance of quality and latency, including local model loading | up to 30 s |
 | `fast` | Lowest latency | no |
 | `voice` | IVR/voice, favors recency | no |
-| `deep` | Maximum recall, 2 graph hops | up to 500 ms |
+| `deep` | Maximum recall, 2 graph hops | up to 60 s |
 
 ### Embeddings are off by default
 
@@ -343,7 +412,7 @@ There are two examples. MCP is the recommended one.
 
 ### 6.1 MCP example (`examples/claude-code-mcp`, `mcp/`, `cmd/niromem/mcp.go`)
 
-**Integrated mode** (`serve -mcp`): the MCP handler calls the engine directly, in the same process and port as the API. No adapter, no `NIROMEM_URL`.
+**Integrated mode** (`serve -mcp`): MCP reuses the authenticated native API handler in-process, on the same port. No adapter process or `NIROMEM_URL`.
 
 **Standalone mode** (`examples/claude-code-mcp/main.go`, binary `niromem-mcp`): the same MCP implementation, but it calls an existing remote API through `client.New(NIROMEM_URL, NIROMEM_API_KEY)`. Serves stdio by default or `-http <loopback addr>`. Do not run it together with `serve -mcp` (port conflict).
 
@@ -354,17 +423,17 @@ Claude Code                        niromem (serve -mcp)
     │  POST /mcp  tools/call           │
     │  {name: search_memory, ...}  ───►│ 1. Host/Origin validation (loopback only, no CORS)
     │                                  │ 2. Authenticate (API key or dev auth)
-    │                                  │ 3. Check key binding == configured user/agent
-    │                                  │ 4. Dispatch tool, 5 s timeout
-    │                                  │ 5. Engine.Search / Engine.Remember
-    │◄── result {content, isError} ────│    scoped to tenant + user + agent
+    │                                  │ 3. Preserve authenticated tenant/permissions
+    │                                  │ 4. Dispatch allowlisted tool; confirm mutations
+    │                                  │ 5. Native API authorization and engine operation
+    │◄── result {content, isError} ────│    same authorized workspace as UI
 ```
 
 Details worth knowing:
 
 - **Stateless HTTP.** Only `POST /mcp` with `Content-Type: application/json`. No SSE and no sessions.
-- **Identity is fixed by the server**, not by the model. The tool arguments cannot choose user or agent; the server forces `-mcp-user`/`-mcp-agent`. With key auth, a key bound to a different user or agent is rejected (403), and MCP never runs with admin rights.
-- **Strict arguments.** Unknown fields are rejected. `search_memory` accepts only `query`; `remember_memory` accepts only `text` and `slot`. Size limits are enforced (8000 bytes for text/query, 200 for slot). These are protocol guards on tool arguments, not interpretation of what the user said.
+- **Permissions match the UI/API.** Admin identities can access all users in their tenant; bound keys remain restricted. `-mcp-user`/`-mcp-agent` are write defaults, not hidden read filters. Tools cannot choose another tenant or elevate permissions.
+- **Strict arguments.** Tools reject unknown fields and invalid types/bounds. Search supports policy, limits, filters and temporal queries. See [MCP tools](docs/mcp.md) for all schemas, file bounds and confirmation rules.
 - **Errors are explicit.** Tool failures return `"isError": true` rather than an empty success.
 - **Writes are marked.** `remember_memory` stores `Actor: "claude-code-mcp"` and `Metadata.source = "claude-code-mcp"`, with trust `high` (explicit write).
 - **Nothing is automatic.** MCP does not capture transcripts or inject context. Claude calls the tools when you ask and approve.
@@ -492,10 +561,10 @@ Ordered by impact. Items are grounded in what the code and the running setup sho
 
 ### MCP surface
 
-5. **Expose more of the engine.** MCP offers only search and remember. The API already has invalidate, update, forget, history and versions. Adding `forget_memory` / `invalidate_memory` tools (with `destructiveHint`) would let users correct memory without curl.
-6. **Let search choose a policy and limit.** `search_memory` hard-codes `Limit: 8` and the default policy. Optional `policy` and `limit` arguments would help.
+5. **Use workspace lifecycle tools.** MCP now exposes correction, invalidation, deletion, history, versions and confirmed tenant cleanup; inspect permissions with `workspace_info`.
+6. **Choose search policy and limits.** `search_memory` supports both, plus filters and retrieval explanations.
 7. **Return concise results.** Search results are returned as raw JSON. A rendered, trimmed form (like the hooks example's `Context.Render`) would save tokens.
-8. **Scope identity per project.** `claude mcp add --scope user` shares one identity across all Claude projects. Register one server per project, each with its own `-mcp-user`, or use project-scoped registration.
+8. **Scope authorization per project.** An admin key sees its whole tenant regardless of `-mcp-user`. Use a project-bound API key and project-scoped client registration when isolation is needed.
 
 ### Extraction and reconciliation
 

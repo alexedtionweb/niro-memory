@@ -205,11 +205,12 @@ func (e *Engine) handleRelationshipBackfill(ctx context.Context, job store.Job) 
 
 // Exploration is a bounded graph/timeline slice, not an exhaustive tenant dump.
 type Exploration struct {
-	Memories  []memory.Memory  `json:"memories"`
-	Links     []relations.Link `json:"inferred_links"`
-	Relations []relations.Link `json:"relationships"`
-	More      bool             `json:"more"`
-	Offset    int              `json:"offset"`
+	Memories   []memory.Memory  `json:"memories"`
+	Links      []relations.Link `json:"inferred_links"`
+	Relations  []relations.Link `json:"relationships"`
+	More       bool             `json:"more"`
+	Offset     int              `json:"offset"`
+	NextCursor string           `json:"next_cursor,omitempty"`
 }
 
 // Explore revalidates both endpoints of inferred links against the requested
@@ -227,6 +228,7 @@ func (e *Engine) Explore(ctx context.Context, req ListRequest) (*Exploration, er
 	out := &Exploration{Memories: ms, Links: []relations.Link{}, Relations: []relations.Link{}, More: len(ms) > limit, Offset: req.Offset}
 	if out.More {
 		out.Memories = ms[:limit]
+		out.NextCursor = out.Memories[len(out.Memories)-1].ID
 	}
 	if out.Memories == nil {
 		out.Memories = []memory.Memory{}

@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -103,18 +104,19 @@ type Hit struct {
 // Explain breaks a score into its components so agents and developers can
 // see why a memory was retrieved.
 type Explain struct {
-	Found      []string       `json:"found_by"`
-	Lexical    float64        `json:"lexical"`
-	Vector     float64        `json:"vector"`
-	Entity     float64        `json:"entity"`
-	Entities   []string       `json:"entities,omitempty"`
-	Relevance  float64        `json:"relevance"`
-	Recency    float64        `json:"recency"`
-	Confidence float64        `json:"confidence"`
-	Importance float64        `json:"importance"`
-	Prior      float64        `json:"prior"`
-	Final      float64        `json:"final"`
-	Ranks      map[string]int `json:"ranks,omitempty"`
+	Found         []string       `json:"found_by"`
+	Lexical       float64        `json:"lexical"`
+	Vector        float64        `json:"vector"`
+	Entity        float64        `json:"entity"`
+	Entities      []string       `json:"entities,omitempty"`
+	Relevance     float64        `json:"relevance"`
+	Recency       float64        `json:"recency"`
+	Confidence    float64        `json:"confidence"`
+	Importance    float64        `json:"importance"`
+	ContentWeight float64        `json:"content_weight"`
+	Prior         float64        `json:"prior"`
+	Final         float64        `json:"final"`
+	Ranks         map[string]int `json:"ranks,omitempty"`
 }
 
 const (
@@ -198,6 +200,12 @@ func (s *Searcher) Search(ctx context.Context, r Request) (*Result, error) {
 		res, err = s.hybrid(ctx, r, q, now)
 	}
 	if res != nil {
+		if res.Hits == nil {
+			res.Hits = []Hit{}
+		}
+		if res.Trace == nil {
+			res.Trace = []Step{}
+		}
 		res.Took = time.Since(start)
 	}
 	return res, err
@@ -312,14 +320,23 @@ func (s *Searcher) hybrid(ctx context.Context, r Request, q store.Query, now tim
 				return
 			}
 			c.mu.Lock()
-			rank := 0
-			for id, e := range found {
+			ids := make([]string, 0, len(found))
+			for id := range found {
+				ids = append(ids, id)
+			}
+			sort.Slice(ids, func(i, j int) bool {
+				if found[ids[i]].boost != found[ids[j]].boost {
+					return found[ids[i]].boost > found[ids[j]].boost
+				}
+				return ids[i] > ids[j]
+			})
+			for rank, id := range ids {
+				e := found[id]
 				x := c.get(id)
-				rank++
 				if e.boost > x.ent {
 					x.ent = e.boost
 				}
-				x.entities, x.found, x.ranks["entity"] = append(x.entities, e.names...), append(x.found, "entity"), rank
+				x.entities, x.found, x.ranks["entity"] = append(x.entities, e.names...), append(x.found, "entity"), rank+1
 			}
 			c.mu.Unlock()
 			if len(found) > 0 {
@@ -511,7 +528,7 @@ func (s *Searcher) queryVector(ctx context.Context, r Request) ([]float32, strin
 	}
 	ch := make(chan []float32, 1)
 	go func() {
-		ectx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		ectx, cancel := context.WithTimeout(context.WithoutCancel(ctx), max(10*time.Second, r.Policy.EmbedBudget))
 		defer cancel()
 		vs, _, err := s.Embedder.Embed(ectx, embed.Query, []embed.Input{{Modality: "text", Text: r.Text}})
 		if err != nil || len(vs) != 1 {
@@ -610,9 +627,13 @@ func (s *Searcher) rank(ctx context.Context, r Request, q store.Query, now time.
 		}
 		return hits[i].Memory.ID > hits[j].Memory.ID
 	})
+	redundant := 0
+	if !r.AllVersions && r.KnownAt.IsZero() {
+		hits, redundant = collapseDerivedPassages(hits)
+	}
 	hits = mmr(hits, r.Limit, p.MMRLambda)
 	c.steps = append(c.steps, Step{Strategy: "rank", Ran: true, Candidates: len(ms), Took: time.Since(t),
-		Reason: fmt.Sprintf("fusion=%s threshold=%.2f mmr=%.2f", fusionName(p), r.Threshold, p.MMRLambda)})
+		Reason: fmt.Sprintf("fusion=%s threshold=%.2f mmr=%.2f redundant_passages=%d; scores are ranking signals, not confidence", fusionName(p), r.Threshold, p.MMRLambda, redundant)})
 	return &Result{Hits: hits, Trace: orderSteps(c.steps)}, nil
 }
 
@@ -626,13 +647,20 @@ func fusionName(p Policy) string {
 // hit combines relevance with the prior (recency, confidence, importance).
 func (s *Searcher) hit(m memory.Memory, x *cand, rel float64, norm func(float64) float64, r Request, now time.Time) Hit {
 	p := r.Policy
+	if m.Source.Kind == "document" {
+		p.Recency = 0 // Import time is not the age or relevance of a document's content.
+	}
 	rec := recency(now.Sub(m.ValidFrom), p.RecencyHalfLife)
 	pw := p.Recency + p.Confidence + p.Importance
 	prior := 0.0
 	if pw > 0 {
 		prior = (p.Recency*rec + p.Confidence*m.Confidence + p.Importance*m.Importance) / pw
 	}
-	final := (1-p.PriorShare)*rel + p.PriorShare*prior
+	contentWeight := 1.0
+	if m.Source.Kind == "document" && m.Metadata["navigation_only"] == true {
+		contentWeight = .5
+	}
+	final := ((1-p.PriorShare)*rel + p.PriorShare*prior) * contentWeight
 	h := Hit{Memory: m, Score: final}
 	if r.Explain {
 		lexN := 0.0
@@ -641,9 +669,32 @@ func (s *Searcher) hit(m memory.Memory, x *cand, rel float64, norm func(float64)
 		}
 		h.Explain = &Explain{Found: x.found, Lexical: lexN, Vector: x.vec, Entity: x.ent, Entities: x.entities,
 			Relevance: rel, Recency: rec, Confidence: m.Confidence, Importance: m.Importance,
-			Prior: prior, Final: final, Ranks: x.ranks}
+			Prior: prior, Final: final, Ranks: x.ranks, ContentWeight: contentWeight}
 	}
 	return h
+}
+
+// Collapse only plain extractive copies whose original also passed authorization
+// and the query filter. Structured assertions and historical lookups remain intact.
+func collapseDerivedPassages(hits []Hit) ([]Hit, int) {
+	originals := make(map[string]string, len(hits))
+	for _, h := range hits {
+		originals[h.Memory.ID] = memory.Normalize(h.Memory.Text)
+	}
+	out := make([]Hit, 0, len(hits))
+	for _, h := range hits {
+		m := h.Memory
+		if m.Source.Kind == "knowledge_enriched" && m.Subject == "" && m.Predicate == "" && m.Object == "" {
+			if meta, ok := m.Metadata["enrichment"].(map[string]any); ok && meta["mode"] == "extractive" {
+				if id, ok := meta["source_id"].(string); ok && id != m.ID && originals[id] != "" &&
+					strings.Contains(originals[id], memory.Normalize(m.Text)) {
+					continue
+				}
+			}
+		}
+		out = append(out, h)
+	}
+	return out, len(hits) - len(out)
 }
 
 // mmr greedily picks results that are relevant but not redundant

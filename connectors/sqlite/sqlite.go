@@ -84,6 +84,10 @@ func Open(ctx context.Context, o Options) (*Store, error) {
 		w.Close()
 		return nil, fmt.Errorf("sqlite: migrate: %w", err)
 	}
+	if err := migrateJobPriority(ctx, w); err != nil {
+		w.Close()
+		return nil, fmt.Errorf("sqlite: migrate job priority: %w", err)
+	}
 	if _, err := w.ExecContext(ctx, `SELECT closed_at FROM memories LIMIT 0`); err != nil {
 		if _, err := w.ExecContext(ctx, `ALTER TABLE memories ADD COLUMN closed_at INTEGER`); err != nil {
 			// A second opener may have added it while this opener waited.
@@ -159,6 +163,13 @@ func (s *Store) Write(ctx context.Context, b *store.Batch) (rec *store.Receipt, 
 		}
 	}()
 	w := &writer{tx: tx, ctx: ctx, t: b.Tenant, now: s.now()}
+	var fenced bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM tenant_purges WHERE tenant=? AND state<>'complete')`, b.Tenant).Scan(&fenced); err != nil {
+		return nil, err
+	}
+	if fenced {
+		return nil, conflict("tenant cleanup is in progress; writes are locked")
+	}
 	rec, err = w.apply(b)
 	if err != nil {
 		if isUnique(err) {
@@ -473,6 +484,9 @@ func (w *writer) appendEpisode(e *memory.Episode) (store.EpisodeResult, error) {
 }
 
 func (w *writer) enqueue(j store.Job) error {
+	if err := store.ValidateJobPriority(j.Priority); err != nil {
+		return err
+	}
 	if j.NotBefore.IsZero() {
 		j.NotBefore = w.now
 	}
@@ -486,8 +500,8 @@ func (w *writer) enqueue(j store.Job) error {
 			return err
 		}
 	}
-	_, err := w.exec(`INSERT INTO jobs (id, tenant, kind, key, payload, state, not_before, created_at, updated_at) VALUES (?,?,?,?,?,'pending',?,?,?)`,
-		j.ID, w.t, j.Kind, j.Key, []byte(j.Payload), ms(j.NotBefore), ms(w.now), ms(w.now))
+	_, err := w.exec(`INSERT INTO jobs (id, tenant, kind, key, payload, state, not_before, created_at, updated_at, priority) VALUES (?,?,?,?,?,'pending',?,?,?,?)`,
+		j.ID, w.t, j.Kind, j.Key, []byte(j.Payload), ms(j.NotBefore), ms(w.now), ms(w.now), j.Priority)
 	return err
 }
 
@@ -1051,6 +1065,7 @@ func (s *Store) Vectors(ctx context.Context, tenant, model, after string, limit 
 // Missing lists open memories without a vector for model, oldest first.
 func (s *Store) Missing(ctx context.Context, tenant, model string, limit int) ([]vector.Target, error) {
 	rows, err := s.r.QueryContext(ctx, `SELECT m.id FROM memories m WHERE m.tenant = ? AND m.valid_to IS NULL AND m.invalidated_at IS NULL
+		AND m.src_kind <> 'document_manifest'
 		AND NOT EXISTS (SELECT 1 FROM embeddings v WHERE v.tenant = m.tenant AND v.model = ? AND v.target_key = 'm:' || m.id)
 		ORDER BY m.id`+limitOffset(limit, 0), tenant, model)
 	if err != nil {
@@ -1072,7 +1087,7 @@ func (s *Store) Missing(ctx context.Context, tenant, model string, limit int) ([
 func (s *Store) Coverage(ctx context.Context, tenant, model string) (int, int, error) {
 	var have, total int
 	err := s.r.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(EXISTS (SELECT 1 FROM embeddings v WHERE v.tenant = m.tenant AND v.model = ? AND v.target_key = 'm:' || m.id)), 0)
-		FROM memories m WHERE m.tenant = ? AND m.valid_to IS NULL AND m.invalidated_at IS NULL`, model, tenant).Scan(&total, &have)
+		FROM memories m WHERE m.tenant = ? AND m.valid_to IS NULL AND m.invalidated_at IS NULL AND m.src_kind <> 'document_manifest'`, model, tenant).Scan(&total, &have)
 	return have, total, err
 }
 

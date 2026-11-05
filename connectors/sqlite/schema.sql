@@ -1,6 +1,15 @@
 -- niro-agent-memory SQLite schema, version 1.
 -- Times are unix milliseconds (INTEGER). JSON columns hold arrays/objects.
 
+CREATE TABLE IF NOT EXISTS tenant_purges (
+    tenant TEXT PRIMARY KEY, id TEXT NOT NULL, state TEXT NOT NULL,
+    phase INTEGER NOT NULL, deleted INTEGER NOT NULL, ready_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tenant_purge_requests (
+    tenant TEXT NOT NULL, request_id TEXT NOT NULL, purge_id TEXT NOT NULL,
+    PRIMARY KEY (tenant, request_id)
+);
+
 CREATE TABLE IF NOT EXISTS memories (
     tenant         TEXT    NOT NULL,
     id             TEXT    NOT NULL,
@@ -42,6 +51,8 @@ CREATE TABLE IF NOT EXISTS memories (
 -- Newest-first listing inside a tenant narrowed by owner (UNIQUE covers tenant,id).
 CREATE INDEX IF NOT EXISTS memories_owner ON memories (tenant, user_id, agent_id, id);
 CREATE INDEX IF NOT EXISTS memories_hash ON memories (tenant, hash);
+CREATE INDEX IF NOT EXISTS memories_enrichment_identity ON memories
+    (tenant, json_extract(metadata, '$."enrichment_identity"'));
 -- At most one open value per slot and owner.
 CREATE UNIQUE INDEX IF NOT EXISTS memories_slot ON memories (tenant, user_id, agent_id, slot)
     WHERE slot <> '' AND valid_to IS NULL AND invalidated_at IS NULL;
@@ -179,6 +190,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     payload     BLOB,
     state       TEXT    NOT NULL,
     attempts    INTEGER NOT NULL DEFAULT 0,
+    priority    INTEGER NOT NULL DEFAULT 0 CHECK (priority BETWEEN -100 AND 100),
     not_before  INTEGER NOT NULL,
     lease_until INTEGER NOT NULL DEFAULT 0,
     worker      TEXT    NOT NULL DEFAULT '',
@@ -190,6 +202,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_pending_key ON jobs (tenant, kind, key) WHERE state = 'pending' AND key <> '';
 CREATE INDEX IF NOT EXISTS jobs_due ON jobs (state, not_before);
 CREATE INDEX IF NOT EXISTS jobs_key ON jobs (tenant, kind, key);
+CREATE INDEX IF NOT EXISTS jobs_tenant_state_id ON jobs (tenant, state, id);
+CREATE INDEX IF NOT EXISTS jobs_tenant_id ON jobs (tenant, id);
 
 CREATE TABLE IF NOT EXISTS settings (
     tenant TEXT NOT NULL PRIMARY KEY,

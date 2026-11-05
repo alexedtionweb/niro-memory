@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/alexedtionweb/niro-memory/embed"
@@ -16,6 +17,30 @@ import (
 type indexPayload struct {
 	Points  []vector.Point  `json:"points,omitempty"`
 	Targets []vector.Target `json:"targets,omitempty"`
+}
+
+type VectorConfiguration struct {
+	Models []vector.Model `json:"models"`
+	Active string         `json:"active"`
+}
+
+// VectorConfiguration reports the effective model selection, including the
+// implicitly declared embedder, rather than only tenant overrides.
+func (e *Engine) VectorConfiguration(ctx context.Context, tenant string) (VectorConfiguration, error) {
+	var out VectorConfiguration
+	s, err := e.Settings(ctx, tenant)
+	if err != nil {
+		return out, err
+	}
+	models, active := e.models(s)
+	out.Active = active
+	out.Models = make([]vector.Model, 0, len(models))
+	for _, m := range models {
+		m.Active = m.ID == active
+		out.Models = append(out.Models, m)
+	}
+	sort.Slice(out.Models, func(i, j int) bool { return out.Models[i].ID < out.Models[j].ID })
+	return out, nil
 }
 
 func (e *Engine) handleIndex(ctx context.Context, j store.Job) error {

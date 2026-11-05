@@ -25,17 +25,35 @@ export function memoryLink(id, label) {
 export function renderEnrichment(result) {
   const labels = { queued: 'Waiting for extraction', processing: 'Extracting knowledge',
     completed: 'Extraction complete', failed: 'Extraction failed', shadow: 'Test extraction — not applied',
-    disabled: 'Extraction paused', not_scheduled: 'No extraction job recorded', needs_review: 'Source or context changed — review required' };
+    partial: 'Partial extraction — rejected records need review',
+    empty: 'No structured records extracted — source preserved',
+    disabled: 'Extraction paused', not_scheduled: 'No extraction job recorded', needs_review: 'Extraction needs review',
+    source_only: 'Source passages indexed — no duplicate extraction' };
   return h('section', { class: 'card', 'aria-live': 'polite' },
     h('h3', null, labels[result.status] || result.status),
     h('p', { class: 'muted' }, 'The original is saved separately. Extracted interpretations are unreviewed, not automatic corrections.'),
     result.error ? h('p', { class: 'error-message', role: 'alert' }, result.error) : null,
-    result.extraction ? h('p', null, `${result.extraction.model || result.extraction.provider || 'Provider not reported'} · ${ms(result.duration_ns || 0)} · ${(result.extraction.facts || []).length} extracted claims`) : null,
+    result.reason ? h('p', { class: 'muted' }, result.reason) : null,
+    result.extraction?.issues?.length ? h('details', { open: true }, h('summary', null, 'Rejected records / extraction gaps'),
+      result.extraction.issues.map(issue => h('p', { class: 'error-message' }, `${issue.stage} ${issue.index}: ${issue.reason}`))) : null,
+    result.extraction ? h('p', null, `${result.extraction.model || result.extraction.provider || 'Provider not reported'} · ${ms(result.duration_ns || 0)} · ${(result.extraction.facts || []).length} extracted claims · ${(result.extraction.excerpts || []).length} source excerpts`) : null,
+    result.extraction?.normalization_notes?.length ? h('details', null, h('summary', null, 'Extraction validation notes'),
+      result.extraction.normalization_notes.map(note => h('p', { class: 'muted' }, note))) : null,
     (result.extraction?.facts || []).map(f => h('article', { class: 'suggestion' },
       h('p', null, `${f.subject} · ${f.negated ? 'NOT ' : ''}${f.predicate} · ${f.object}`),
       badge(f.type), f.model_type ? h('p', { class: 'muted' }, `Classified from explicit decision predicate; model originally labeled it ${f.model_type}.`) : null,
       h('blockquote', null, f.quote))),
-    (result.changes || []).map(c => memoryLink(c.memory.id, 'Read extracted memory')),
+    (result.extraction?.excerpts || []).map(text => h('article', { class: 'suggestion' },
+      h('p', { class: 'muted' }, 'Verbatim source excerpt — no structured assertion'),
+      h('blockquote', null, text))),
+    result.extraction?.entities?.length ? h('div', null, h('h4', null, 'Named entities'),
+      result.extraction.entities.map(e => h('article', { class: 'suggestion' },
+        h('p', null, e.name, ' ', badge(e.type)),
+        Object.keys(e.attributes || {}).length ? pre(e.attributes) : null,
+        h('blockquote', null, e.quote)))) : null,
+    (result.changes || []).map(c => h('p', null, c.action === 'evidence'
+      ? 'Existing memory matched — no duplicate created. ' : 'Extracted memory saved. ',
+      memoryLink(c.memory.id, c.action === 'evidence' ? 'Read reinforced memory' : 'Read extracted memory'))),
     (result.relations || []).map(r => h('p', null, memoryLink(r.source_id), ` ${r.relation.replaceAll('_', ' ')} `, memoryLink(r.target_id),
       r.relation === 'contradicts' ? ' — potential conflict, needs review' : '')),
     h('details', null, h('summary', null, 'Extraction evidence & diagnostics'), pre(result)));
@@ -43,7 +61,7 @@ export function renderEnrichment(result) {
 
 export async function inspectEnrichment(root, id) {
   const active = workspaceSession(root);
-  const view = h('div');
+  const view = h('div', null, h('p', { role: 'status' }, 'Checking background extraction status…'));
   let generation = 0;
   const refresh = async () => {
     const current = ++generation;
@@ -97,7 +115,8 @@ export function memoryCard(m) {
       h('span', null, m.recorded_at ? `Learned ${date(m.recorded_at)}` : 'Recorded time unavailable')),
     assertion ? h('p', null, `${assertion.subject} · ${assertion.conditions?.polarity === 'negative' ? 'NOT ' : ''}${assertion.predicate} · ${assertion.object}`) : null,
     m.metadata?.enrichment ? h('p', { class: 'muted' }, 'Unreviewed extraction · ', memoryLink(m.metadata.enrichment.source_id, 'Original source')) : null,
-    (m.entities || []).length ? h('p', null, 'Entities: ', m.entities.map(e => badge(e.name))) : null,
+    (m.entities || []).length ? h('p', null, 'Entities: ', m.entities.map(e => badge(e.type ? `${e.name} (${e.type})` : e.name))) : null,
+    m.metadata?.extracted_entities?.length ? h('details', null, h('summary', null, 'Original entity annotations (unreviewed)'), pre(m.metadata.extracted_entities)) : null,
     decision ? h('p', null, `Decision: ${decision.status || 'status not recorded'}${decision.outcome ? ' — ' + decision.outcome : ''}`) : null,
     h('div', { class: 'row' }, memoryLink(m.id, 'Read memory & history'),
       h('a', { href: '#/intelligence/' + encodeURIComponent(m.id) }, 'Suggest a correction')),

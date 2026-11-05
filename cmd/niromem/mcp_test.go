@@ -92,10 +92,14 @@ func TestMCPKnowledgeInspectionAndProposal(t *testing.T) {
 		}
 		return result.Content[0].Text
 	}
-	inspection := toolText(call(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"inspect_knowledge","arguments":{"slot":"project.test_command"}}}`), false)
+	inspection := toolText(call(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"inspect_knowledge","arguments":{"slot":"project.test_command","user_id":"project"}}}`), false)
 	if !strings.Contains(inspection, "one/project test command") ||
 		strings.Contains(inspection, "another-project") || strings.Contains(inspection, "two/project") {
 		t.Fatalf("integrated inspection leaked scope: %s", inspection)
+	}
+	workspaceSearch := toolText(call(`{"jsonrpc":"2.0","id":"workspace-search","method":"tools/call","params":{"name":"search_memory","arguments":{"query":"test command"}}}`), false)
+	if !strings.Contains(workspaceSearch, "one/another-project test command") || strings.Contains(workspaceSearch, "two/project test command") {
+		t.Fatalf("admin MCP does not match UI tenant access: %s", workspaceSearch)
 	}
 	proposal := toolText(call(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"propose_memory_update","arguments":{"operation_key":"integrated-dry-run","text":"Use go test ./...","slot":"project.proposed_command"}}}`), false)
 	var result niromem.KnowledgeResult
@@ -103,7 +107,7 @@ func TestMCPKnowledgeInspectionAndProposal(t *testing.T) {
 		result.Scope != (memory.Scope{Tenant: "one", User: "project", Agent: "claude-code"}) {
 		t.Fatalf("proposal scope/result: %s %v", proposal, err)
 	}
-	toolText(call(`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"inspect_knowledge","arguments":{"slot":"project.test_command","user_id":"another-project"}}}`), true)
+	toolText(call(`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"inspect_knowledge","arguments":{"slot":"project.test_command","tenant":"two"}}}`), true)
 	memories, err := engine.List(ctx, niromem.ListRequest{Tenant: "one", User: "project", Agent: "claude-code"})
 	if err != nil || len(memories) != 1 || memories[0].Slot != "project.test_command" {
 		t.Fatalf("dry-run changed persistent memories: %+v %v", memories, err)
@@ -147,7 +151,7 @@ func TestMCPAuthAndGuards(t *testing.T) {
 	for _, tc := range []struct {
 		key  string
 		code int
-	}{{"", 401}, {otherKey, 403}, {key, 200}} {
+	}{{"", 401}, {otherKey, 200}, {key, 200}} {
 		r := httptest.NewRequest("POST", "http://localhost:8080/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
 		r.Header.Set("Authorization", "Bearer "+tc.key)
 		r.Header.Set("Content-Type", "application/json")
@@ -178,6 +182,9 @@ func TestMCPAuthAndGuards(t *testing.T) {
 	}
 	if strings.Contains(call(tenantKey, query), "Tenant one connector convention") {
 		t.Fatal("MCP leaked memory across tenants")
+	}
+	if strings.Contains(call(otherKey, query), "Tenant one connector convention") {
+		t.Fatal("MCP widened bound user permissions")
 	}
 }
 

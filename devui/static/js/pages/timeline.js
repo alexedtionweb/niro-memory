@@ -1,7 +1,10 @@
 import { call, h, page, badge, date, guard } from '../lib.js';
 import { timelineEvents } from '../explorer-model.js';
+import { workspaceSession } from '../knowledge-ui.js';
 
 export default async function(root) {
+  const active = workspaceSession(root);
+  let generation = 0;
   let offset = 0, data, mode = 'recorded';
   const events = h('div', { class: 'timeline-feed' }), count = h('p', { class: 'muted' });
   const user = h('input', { placeholder: 'user_id (optional)', 'aria-label': 'Timeline user scope' });
@@ -25,7 +28,11 @@ export default async function(root) {
       : [h('div', { class: 'empty-state' }, 'No memory events in this slice.')]));
   }
   async function load() {
-    data = await call('GET', `/v1/explore?all_versions=true&limit=100&offset=${offset}&user_id=${encodeURIComponent(user.value.trim())}`);
+    if (!active()) return;
+    const token = ++generation;
+    const result = await call('GET', `/v1/explore?all_versions=true&show_expired=true&limit=100&offset=${offset}&user_id=${encodeURIComponent(user.value.trim())}`);
+    if (!active() || token !== generation) return;
+    data = { ...result, memories: result.memories ?? [], inferred_links: result.inferred_links ?? [] };
     previous.disabled = offset === 0; next.disabled = !data.more; render();
   }
   select.addEventListener('change', () => { mode = select.value; render(); });

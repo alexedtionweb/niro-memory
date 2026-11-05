@@ -130,6 +130,62 @@ func TestOllamaThinkingOption(t *testing.T) {
 	}
 }
 
+func TestOllamaGenerationLimitsApplyToPlannerAndExtraction(t *testing.T) {
+	for _, custom := range []bool{false, true} {
+		t.Run(fmt.Sprint(custom), func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					Options   map[string]int `json:"options"`
+					KeepAlive string         `json:"keep_alive"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				threads, tokens, output := 4, 4096, 512
+				if calls > 0 {
+					output = 1200
+				}
+				if custom {
+					threads, tokens, output = 2, 2048, 768
+				}
+				if body.KeepAlive != "10m" || body.Options["num_thread"] != threads ||
+					body.Options["num_ctx"] != tokens || body.Options["num_predict"] != output ||
+					body.Options["num_gpu"] != 0 || body.Options["temperature"] != 0 {
+					t.Errorf("unbounded CPU request: %+v", body)
+				}
+				if calls == 0 {
+					writeOllamaPlan(w, `{"operations":[{"type":"ADD","reason_code":"explicit_add"}]}`)
+				} else {
+					writeOllamaPlan(w, `{"facts":[],"entities":[],"relations":[]}`)
+				}
+				calls++
+			}))
+			defer server.Close()
+			opts := Options{Protocol: ProtocolOllama, BaseURL: server.URL, Model: "fixture"}
+			if custom {
+				opts.NumThread, opts.NumCtx, opts.NumPredict = 2, 2048, 768
+			}
+			c, err := New(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Plan(context.Background(), sampleInput(), domain.State{}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Enrich(context.Background(), domain.EnrichmentInput{Text: "Hello!"}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	for _, opts := range []Options{{NumThread: -1}, {NumThread: 257}, {NumCtx: -1}, {NumCtx: 32769}, {NumPredict: -1}, {NumPredict: 4097}} {
+		opts.Protocol, opts.BaseURL, opts.Model = ProtocolOllama, "http://localhost:11434", "fixture"
+		if _, err := New(opts); err == nil {
+			t.Fatalf("invalid limits accepted: %+v", opts)
+		}
+	}
+}
+
 func TestPlannerRejectsInvalidModelSchemasAndReferences(t *testing.T) {
 	for _, response := range []string{
 		`{"operations":[{"type":"DELETE","reason_code":"bad"}]}`,

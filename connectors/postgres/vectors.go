@@ -179,6 +179,7 @@ func (s *Store) Missing(ctx context.Context, tenant, model string, limit int) ([
 	var out []vector.Target
 	err := s.read(ctx, tenant, func(c q) error {
 		rows, err := c.Query(ctx, `SELECT m.id FROM memories m WHERE m.tenant = $1 AND m.valid_to IS NULL AND m.invalidated_at IS NULL
+			AND m.src_kind <> 'document_manifest'
 			AND NOT EXISTS (SELECT 1 FROM embeddings v WHERE v.tenant = m.tenant AND v.model = $2 AND v.target_key = 'm:' || m.id)
 			ORDER BY m.id LIMIT $3`, tenant, model, limit)
 		if err != nil {
@@ -201,7 +202,7 @@ func (s *Store) Missing(ctx context.Context, tenant, model string, limit int) ([
 func (s *Store) Coverage(ctx context.Context, tenant, model string) (have, total int, err error) {
 	err = s.read(ctx, tenant, func(c q) error {
 		return c.QueryRow(ctx, `SELECT COUNT(*), COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM embeddings v WHERE v.tenant = m.tenant AND v.model = $2 AND v.target_key = 'm:' || m.id))
-			FROM memories m WHERE m.tenant = $1 AND m.valid_to IS NULL AND m.invalidated_at IS NULL`, tenant, model).Scan(&total, &have)
+			FROM memories m WHERE m.tenant = $1 AND m.valid_to IS NULL AND m.invalidated_at IS NULL AND m.src_kind <> 'document_manifest'`, tenant, model).Scan(&total, &have)
 	})
 	return have, total, err
 }

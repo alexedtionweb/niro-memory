@@ -28,9 +28,11 @@ type Options struct {
 	ID                          string // default ollama/<Model>@1
 	QueryPrefix, DocumentPrefix string
 	BatchSize                   int // default 32
+	ChunkSize                   int // maximum source bytes per chunk; zero disables chunking
 	KeepAlive                   string
 	Truncate                    bool // default false: reject oversized input rather than silently losing text
 	SendDimensions              bool
+	Timeout                     time.Duration // default 5m; used when HTTP is nil
 	HTTP                        *http.Client
 }
 
@@ -44,6 +46,12 @@ func New(o Options) (*Embedder, error) {
 	if strings.TrimSpace(o.Model) == "" || o.Dims <= 0 {
 		return nil, fmt.Errorf("ollama: model and positive dims are required")
 	}
+	if o.Timeout < 0 {
+		return nil, fmt.Errorf("ollama: timeout must not be negative")
+	}
+	if o.ChunkSize < 0 || o.ChunkSize > 0 && (o.ChunkSize < 4 || o.Truncate) {
+		return nil, fmt.Errorf("ollama: chunk_size must be zero or at least 4 bytes, and requires truncate:false")
+	}
 	if o.BaseURL == "" {
 		o.BaseURL = "http://127.0.0.1:11434"
 	}
@@ -54,12 +62,18 @@ func New(o Options) (*Embedder, error) {
 	o.BaseURL = strings.TrimRight(o.BaseURL, "/")
 	if o.ID == "" {
 		o.ID = "ollama/" + o.Model + "@1"
+		if o.ChunkSize > 0 {
+			o.ID = fmt.Sprintf("ollama/%s-chunk%d-mean@1", o.Model, o.ChunkSize)
+		}
 	}
 	if o.BatchSize <= 0 {
 		o.BatchSize = 32
 	}
 	if o.HTTP == nil {
-		o.HTTP = &http.Client{Timeout: 60 * time.Second}
+		if o.Timeout == 0 {
+			o.Timeout = 5 * time.Minute
+		}
+		o.HTTP = &http.Client{Timeout: o.Timeout}
 	}
 	return &Embedder{o: o}, nil
 }
@@ -71,7 +85,7 @@ func (e *Embedder) Model() vector.Model {
 
 // Embed uses the native batch API. Cancellation and server errors propagate;
 // the engine's durable embedding jobs supply retries for document writes.
-func (e *Embedder) Embed(ctx context.Context, purpose embed.Purpose, in []embed.Input) ([][]float32, embed.Usage, error) {
+func (e *Embedder) embedRaw(ctx context.Context, purpose embed.Purpose, in []embed.Input) ([][]float32, embed.Usage, error) {
 	usage := embed.Usage{Inputs: len(in)}
 	prefix := e.o.DocumentPrefix
 	if purpose == embed.Query {
@@ -110,7 +124,7 @@ func (e *Embedder) Embed(ctx context.Context, purpose embed.Purpose, in []embed.
 		}
 		resp, err := e.o.HTTP.Do(req)
 		if err != nil {
-			return nil, usage, fmt.Errorf("ollama: embed request: %w", err)
+			return nil, usage, fmt.Errorf("ollama: embed request (model %s, batch %d inputs, HTTP timeout %s): %w", e.o.Model, len(batch), e.o.HTTP.Timeout, err)
 		}
 		var result struct {
 			Embeddings [][]float32 `json:"embeddings"`
@@ -122,6 +136,13 @@ func (e *Embedder) Embed(ctx context.Context, purpose embed.Purpose, in []embed.
 			resp.Body.Close()
 			if readErr != nil {
 				return nil, usage, fmt.Errorf("ollama: read error response: %w", readErr)
+			}
+			var failure struct {
+				Error string `json:"error"`
+			}
+			if resp.StatusCode == http.StatusBadRequest && json.Unmarshal(raw, &failure) == nil &&
+				failure.Error == "the input length exceeds the context length" {
+				return nil, usage, fmt.Errorf("ollama: %s: %w", resp.Status, errContextLength)
 			}
 			return nil, usage, fmt.Errorf("ollama: %s: %s", resp.Status, raw)
 		}

@@ -128,6 +128,12 @@ func connectors(ctx context.Context, cfg *Config, o *niromem.Options) (closers [
 		return closers, fmt.Errorf("unknown blob store %q (dir, memory, s3)", cfg.Blob.Use)
 	}
 
+	if err := configureDocuments(cfg, o); err != nil {
+		return closers, err
+	}
+	if err := configureMultimodal(cfg, o); err != nil {
+		return closers, err
+	}
 	switch cfg.Cache.Use {
 	case "", "lru":
 		var opt struct {
@@ -190,6 +196,7 @@ func connectors(ctx context.Context, cfg *Config, o *niromem.Options) (closers [
 		o.Embedder = em
 	case "ollama":
 		var opt ollama.Options
+		var timeoutMS int64
 		if err := cfg.Embedder.Decode(&struct {
 			BaseURL        *string `json:"base_url"`
 			APIKey         *string `json:"api_key"`
@@ -202,9 +209,15 @@ func connectors(ctx context.Context, cfg *Config, o *niromem.Options) (closers [
 			BatchSize      *int    `json:"batch_size"`
 			KeepAlive      *string `json:"keep_alive"`
 			Truncate       *bool   `json:"truncate"`
-		}{&opt.BaseURL, &opt.APIKey, &opt.Model, &opt.Dims, &opt.ID, &opt.SendDimensions, &opt.QueryPrefix, &opt.DocumentPrefix, &opt.BatchSize, &opt.KeepAlive, &opt.Truncate}); err != nil {
+			TimeoutMS      *int64  `json:"timeout_ms"`
+			ChunkSize      *int    `json:"chunk_size"`
+		}{&opt.BaseURL, &opt.APIKey, &opt.Model, &opt.Dims, &opt.ID, &opt.SendDimensions, &opt.QueryPrefix, &opt.DocumentPrefix, &opt.BatchSize, &opt.KeepAlive, &opt.Truncate, &timeoutMS, &opt.ChunkSize}); err != nil {
 			return closers, err
 		}
+		if timeoutMS < 0 || timeoutMS > int64((1<<63-1)/time.Millisecond) {
+			return closers, fmt.Errorf("ollama: embedding timeout_ms must be non-negative and fit a duration")
+		}
+		opt.Timeout = time.Duration(timeoutMS) * time.Millisecond
 		em, err := ollama.New(opt)
 		if err != nil {
 			return closers, err
@@ -237,7 +250,8 @@ func connectors(ctx context.Context, cfg *Config, o *niromem.Options) (closers [
 		o.Rules = rs
 	}
 	o.Knowledge = niromem.KnowledgeOptions{
-		Mode: cfg.Knowledge.Mode, MaxCandidates: cfg.Knowledge.MaxCandidates,
+		Extraction: cfg.Knowledge.Extraction,
+		Mode:       cfg.Knowledge.Mode, MaxCandidates: cfg.Knowledge.MaxCandidates,
 		MaxGraphHops: cfg.Knowledge.MaxGraphHops,
 		Timeout:      time.Duration(cfg.Knowledge.TimeoutMS) * time.Millisecond,
 		Fallback:     cfg.Knowledge.Fallback, Consolidation: cfg.Knowledge.Consolidation,
@@ -284,13 +298,26 @@ func knowledgePlanner(choice Choice) (knowledge.Planner, error) {
 		return knowledge.Deterministic{}, nil
 	case "openai", "ollama":
 		var settings struct {
-			BaseURL string `json:"base_url"`
-			APIKey  string `json:"api_key"`
-			Model   string `json:"model"`
-			Think   *bool  `json:"think"`
+			BaseURL          string `json:"base_url"`
+			APIKey           string `json:"api_key"`
+			Model            string `json:"model"`
+			Think            *bool  `json:"think"`
+			NumThread        int    `json:"num_thread"`
+			NumCtx           int    `json:"num_ctx"`
+			NumPredict       int    `json:"num_predict"`
+			StagedExtraction bool   `json:"staged_extraction"`
+			ExtractiveOnly   bool   `json:"extractive_only"`
+			TimeoutMS        int64  `json:"timeout_ms"`
 		}
 		if err := choice.Decode(&settings); err != nil {
 			return nil, err
+		}
+		httpTimeout := 11 * time.Minute
+		if settings.TimeoutMS < 0 || settings.TimeoutMS > 1860000 {
+			return nil, fmt.Errorf("knowledge: provider timeout_ms must be between 0 and 1860000")
+		}
+		if settings.TimeoutMS > 0 {
+			httpTimeout = time.Duration(settings.TimeoutMS) * time.Millisecond
 		}
 		protocol := choice.Use
 		if protocol == "openai" {
@@ -298,6 +325,10 @@ func knowledgePlanner(choice Choice) (knowledge.Planner, error) {
 		}
 		return knowledgeprovider.New(knowledgeprovider.Options{
 			Protocol: protocol, BaseURL: settings.BaseURL, APIKey: settings.APIKey, Model: settings.Model, Think: settings.Think,
+			HTTP:      &http.Client{Timeout: httpTimeout},
+			NumThread: settings.NumThread, NumCtx: settings.NumCtx, NumPredict: settings.NumPredict,
+			StagedExtraction: settings.StagedExtraction,
+			ExtractiveOnly:   settings.ExtractiveOnly,
 		})
 	default:
 		return nil, fmt.Errorf("unknown knowledge planner %q", choice.Use)

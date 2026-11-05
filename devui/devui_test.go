@@ -51,6 +51,30 @@ func TestConsole(t *testing.T) {
 	if code, _ := do("GET", "/_dev/js/app.js", "", ""); code != 200 {
 		t.Fatal("static assets")
 	}
+	for _, path := range []string{"/_dev/vendor/htmx-2.0.8.min.js", "/_dev/vendor/pico-2.1.1.min.css"} {
+		if code, _ := do("GET", path, "", ""); code != 200 {
+			t.Fatalf("locally served framework asset: %s %d", path, code)
+		}
+	}
+	if code, _ := do("GET", "/_dev/views/workspace", "", ""); code != 401 {
+		t.Fatal("workspace fragment must authenticate")
+	}
+	if code, _ := do("GET", "/_dev/views/models", "user-key-01234567890", ""); code != 403 {
+		t.Fatal("workspace fragment must require admin")
+	}
+	for _, screen := range []string{"workspace", "models", "operations"} {
+		if code, body := do("GET", "/_dev/views/"+screen, "admin-key-0123456789", ""); code != 200 || !strings.Contains(body, `data-screen="`+screen+`"`) {
+			t.Fatalf("workspace fragment: %s %d %s", screen, code, body)
+		}
+	}
+	for _, path := range []string{"/_dev/views/missing", "/_dev/views/models?view=sql"} {
+		if code, _ := do("GET", path, "admin-key-0123456789", ""); code != 404 {
+			t.Fatalf("unknown module must not render: %s %d", path, code)
+		}
+	}
+	if code, body := do("GET", "/_dev/views/models?view=schema&focus=%22%3E%3Cscript%3Ealert(1)%3C/script%3E", "admin-key-0123456789", ""); code != 200 || strings.Contains(body, "<script>") || !strings.Contains(body, `data-module="schema"`) {
+		t.Fatalf("escaped schema fragment: %d %s", code, body)
+	}
 	if code, _ := do("GET", "/_dev/api/info", "", ""); code != 401 {
 		t.Fatal("unauthenticated dev API")
 	}
@@ -62,6 +86,9 @@ func TestConsole(t *testing.T) {
 	json.Unmarshal([]byte(body), &info)
 	if code != 200 || info["tenant"] != "t" {
 		t.Fatalf("info: %d %s", code, body)
+	}
+	if code, body := do("GET", "/_dev/api/jobs", "admin-key-0123456789", ""); code != 200 || strings.TrimSpace(body) != "[]" {
+		t.Fatalf("empty queue must be an array: %d %s", code, body)
 	}
 	if code, body := do("POST", "/_dev/api/rules/test", "admin-key-0123456789", `{"rules":{"version":1,"facts":[{"id":"x","pattern":"(?P<n>cat)","emit":{"text":"has {n}"}}]},"text":"I have a cat."}`); code != 200 || !strings.Contains(body, `"text":"has cat"`) {
 		t.Fatalf("rules test: %d %s", code, body)

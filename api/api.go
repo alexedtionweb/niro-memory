@@ -151,6 +151,7 @@ func (s *Server) Handler() http.Handler {
 		})
 	}
 	s.native(mux)
+	s.documents(mux)
 	s.mem0(mux)
 	return mux
 }

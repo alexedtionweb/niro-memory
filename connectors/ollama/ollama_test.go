@@ -6,13 +6,48 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/alexedtionweb/niro-memory/connectors/ollama"
 	"github.com/alexedtionweb/niro-memory/embed"
 	"github.com/alexedtionweb/niro-memory/vector"
 )
+
+func TestLocalEmbeddingAPI(t *testing.T) {
+	if os.Getenv("NIROMEM_TEST_LOCAL_EMBEDDING") != "1" {
+		t.Skip("set NIROMEM_TEST_LOCAL_EMBEDDING=1 to call local Ollama with generated fixtures")
+	}
+	e, err := ollama.New(ollama.Options{Model: "nomic-embed-text", Dims: 768, ID: "ollama/nomic-embed-text@1",
+		QueryPrefix: "search_query: ", DocumentPrefix: "search_document: ", KeepAlive: "10m", Timeout: 10 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for _, sample := range []struct {
+		name    string
+		purpose embed.Purpose
+		inputs  []embed.Input
+	}{
+		{"query", embed.Query, []embed.Input{{Text: "generated embedding latency check"}}},
+		{"documents", embed.Document, []embed.Input{{Text: "Atlas uses Redis."}, {Text: "Bruna trabalha na Contoso."}}},
+	} {
+		start := time.Now()
+		vectors, _, err := e.Embed(ctx, sample.purpose, sample.inputs)
+		if err != nil || len(vectors) != len(sample.inputs) {
+			t.Fatalf("%s embeddings: count=%d error=%v", sample.name, len(vectors), err)
+		}
+		for _, v := range vectors {
+			if len(v) != 768 {
+				t.Fatalf("embedding dimensions=%d want 768", len(v))
+			}
+		}
+		t.Logf("%s: %d vectors, 768 dimensions, %s", sample.name, len(vectors), time.Since(start).Round(time.Millisecond))
+	}
+}
 
 func TestBatchAndPrefixes(t *testing.T) {
 	var inputs []string

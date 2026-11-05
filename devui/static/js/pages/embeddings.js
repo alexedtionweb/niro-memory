@@ -1,61 +1,108 @@
-// Embeddings: declared models, coverage per model, backfill and the
-// blue/green switch of the active model.
-import { call, h, page, table, badge, guard, toast, pre } from '../lib.js';
+import { call, h, page, badge, pre, toast } from '../lib.js';
+import { workspaceSession } from '../knowledge-ui.js';
 
-export default async function (root) {
-  const settings = await call('GET', '/v1/settings');
-  const models = [...(settings.vector_models || [])];
-  const capabilities = (await call('GET', '/_dev/api/info')).capabilities;
-  const emb = capabilities.embedder;
-  if (emb && !models.find((m) => m.id === emb)) models.unshift({ id: emb, dims: '(embedder)', active: !models.some((m) => m.active), implicit: true });
-  const rows = await Promise.all(models.map(async (m) => {
+export default async function(root) {
+  const active = workspaceSession(root);
+  const modelsView = h('div'), jobsView = h('div'), summary = h('div');
+  const message = h('p', { role: 'status' });
+  let busy = false, polling = false, timer;
+  const refreshButton = h('button', { onclick: refresh }, 'Refresh coverage');
+  const backfill = h('button', { class: 'primary', 'data-action': 'backfill', onclick: async () => {
+    if (!active() || busy) return;
+    busy = true; backfill.disabled = true;
     try {
-      const c = await call('GET', '/v1/vectors/coverage?model=' + encodeURIComponent(m.id));
-      return { ...m, ...c };
-    } catch (e) { return { ...m, coverageError: e.message }; }
-  }));
-  const activate = guard(async (m) => {
-    if (m.total && m.have < m.total && !confirm(`Only ${m.have}/${m.total} memories have ${m.id} vectors. Switch anyway?`)) return;
-    const s = await call('GET', '/v1/settings');
-    s.vector_models = (s.vector_models || []).map((x) => ({ ...x, active: x.id === m.id }));
-    if (!s.vector_models.find((x) => x.id === m.id)) s.vector_models.forEach((x) => (x.active = false));
-    await call('PUT', '/v1/settings', s);
-    toast('Active model: ' + m.id);
-    location.reload();
-  });
-  page(root, 'Embeddings & semantic readiness', 'A vector index is storage, not a model. Semantic retrieval also needs query embeddings, document coverage, an active model, and a suitable query budget.',
-    h('div', { class: 'card' },
-      h('h2', null, emb ? (emb === 'hash@1' ? 'Test embedder only — not semantic' : 'Text embedder configured') : 'Automatic text embeddings are not configured'),
-      h('p', null, badge(capabilities.vector ? 'Vector index available' : 'No vector index', capabilities.vector ? 'ok' : 'warn'),
-        badge(emb || 'No embedder', emb && emb !== 'hash@1' ? 'ok' : 'warn')),
-      h('p', { class: 'muted' }, emb === 'hash@1'
-        ? 'Hash vectors exercise the vector path, but do not understand meaning. Configure a real embedding model for semantic recall.'
-        : emb ? 'Check coverage below and the Search playground trace to confirm vectors actually participate in retrieval.'
-          : 'Lexical and entity retrieval still work. Caller-supplied vectors are supported. To embed text automatically, configure an optional provider and restart the server.'),
-      h('p', null, 'Existing memories need backfill. Local models may exceed the default 50 ms embedding budget; configure a tenant policy with a realistic budget and inspect skipped strategies in ',
-        h('a', { href: '#/search' }, 'Search playground'), '.')),
-    h('div', { class: 'card' },
-      table([
-        { label: 'model', render: (m) => [h('b', null, m.id), m.implicit ? badge('embedder') : null] },
-        { label: 'dims', key: 'dims' }, { label: 'modalities', render: (m) => (m.modalities || ['text']).join(', ') },
-        { label: 'coverage', render: (m) => {
-          if (m.coverageError) return badge('Coverage failed: ' + m.coverageError, 'bad');
-          const pct = m.total ? Math.round((100 * m.have) / m.total) : 0;
-          const bar = h('div', { class: 'bar' }, h('span', { class: 'vec' }));
-          bar.firstChild.style.width = pct + '%';
-          return [bar, h('span', { class: 'muted' }, ` ${m.have}/${m.total} (${pct}%)`)];
-        } },
-        { label: 'state', render: (m) => (m.active ? badge('active', 'ok') : h('button', { disabled: !!m.coverageError, onclick: () => activate(m) }, 'make active')) },
-      ], rows),
-      h('div', { class: 'row' },
-        emb ? h('button', { class: 'primary', onclick: guard(async () => { await call('POST', '/v1/vectors/backfill'); toast('Backfill queued — run the worker (Jobs page)'); }) }, 'Backfill missing with ' + emb)
-          : h('p', { class: 'muted' }, 'No embedder configured: bring vectors via the API (PUT /v1/vectors, or vectors on facts and turns).'))),
-    h('div', { class: 'card' }, h('h2', null, 'Optional providers'),
-      h('p', null, 'Ollama native: use "ollama" with /api/embed. OpenAI, LM Studio, vLLM, TEI, and LiteLLM: use "openai" with an OpenAI-compatible /embeddings endpoint. No provider SDK is required.'),
-      h('p', { class: 'muted' }, 'Example server config section (not tenant settings). Install the model in your Ollama service separately; the server never downloads models.'),
+      await call('POST', '/v1/vectors/backfill');
+      if (!active()) return;
+      polling = true;
+      message.textContent = 'Backfill queued for existing memories. Watching real coverage; the server worker must be running.';
+    } catch (e) {
+      if (active()) message.textContent = 'Backfill failed: ' + e.message;
+    } finally { busy = false; if (active()) await refresh(); }
+  } }, 'Embed existing memories');
+
+  async function activate(model) {
+    if (!active() || busy) return;
+    if (model.have < model.total && !confirm(`Only ${model.have}/${model.total} memories have these vectors. Switch anyway?`)) return;
+    busy = true;
+    try {
+      const settings = await call('GET', '/v1/settings');
+      if (!active()) return;
+      settings.vector_models = (settings.vector_models || []).map(m => ({ ...m, active: m.id === model.id }));
+      await call('PUT', '/v1/settings', settings);
+      if (active()) { toast('Active model: ' + model.id); window.dispatchEvent(new Event('niromem:config')); }
+    } catch (e) {
+      if (active()) message.textContent = 'Model switch failed: ' + e.message;
+    } finally { busy = false; if (active()) await refresh(); }
+  }
+
+  async function refresh() {
+    if (!active() || busy) return;
+    clearTimeout(timer);
+    busy = true; refreshButton.disabled = true; backfill.disabled = true;
+    try {
+      const info = await call('GET', '/_dev/api/info');
+      if (!active()) return;
+      const embedder = info.capabilities?.embedder;
+      if (!info.vectors || !Array.isArray(info.vectors.models)) throw new Error('Effective vector configuration is unavailable. Restart the server with the updated build.');
+      const rows = await Promise.all(info.vectors.models.map(async model => {
+        try {
+          return { ...model, ...await call('GET', '/v1/vectors/coverage?model=' + encodeURIComponent(model.id)) };
+        } catch (e) { return { ...model, error: e.message }; }
+      }));
+      if (!active()) return;
+      summary.replaceChildren(
+        h('h2', null, embedder && embedder !== 'hash@1' ? 'Semantic embedding model configured' : 'Semantic embedding model unavailable'),
+        h('p', null, badge(embedder || 'No embedder', embedder && embedder !== 'hash@1' ? 'ok' : 'warn'),
+          badge(info.capabilities.vector ? 'Vector index available' : 'No vector index', info.capabilities.vector ? 'ok' : 'warn')),
+        h('p', null, 'Query model: ', h('strong', null, info.vectors.active || 'None')),
+        h('p', { class: 'muted' }, 'Coverage is counted from stored vectors, not inferred from configuration. Backfill processes existing items; new writes are queued automatically.'));
+      modelsView.replaceChildren(...rows.map(model => h('article', { class: 'embedding-model card' },
+        h('h2', null, model.id, model.id === info.vectors.active ? badge('Active query model', 'ok') : null),
+        h('p', { class: 'muted' }, `${model.dims} dimensions · ${(model.modalities || ['text']).join(', ')}`),
+        model.error ? h('p', { class: 'error-message', role: 'alert' }, 'Coverage failed: ' + model.error)
+          : h('div', null, h('progress', { max: Math.max(1, model.total), value: model.have, 'aria-label': 'Embedding coverage for ' + model.id }),
+            h('p', null, h('strong', null, `${model.have}/${model.total}`), ' current memories embedded',
+              model.total === 0 ? ' — no current memories in this tenant.' : model.have === model.total ? ' — ready.' : ` — ${model.total - model.have} missing.`)),
+        model.id !== info.vectors.active ? h('button', { disabled: !!model.error, onclick: () => activate(model) }, 'Use for queries') : null)));
+      backfill.disabled = !embedder || !info.capabilities.vector;
+      if (!rows.length) modelsView.replaceChildren(h('p', null, 'No vector models declared. Configure an embedder in the server configuration.'));
+      const current = rows.find(m => m.id === embedder);
+      const covered = current && !current.error && current.have === current.total;
+      try {
+        const jobs = ((await call('GET', '/_dev/api/jobs')) || []).filter(j => j.kind === 'embed');
+        if (!active()) return;
+        jobsView.replaceChildren(h('h2', null, 'Embedding jobs'),
+          ...(jobs.length ? jobs.map(j => h('p', { class: j.state === 'dead' ? 'error-message' : '' },
+            badge(j.state, j.state === 'dead' ? 'bad' : ''), ` ${j.key} · attempts ${j.attempts}`,
+            j.last_error ? h('span', null, ' · ' + j.last_error) : null)) : [h('p', { class: 'muted' }, 'No outstanding embedding jobs.')]),
+          h('a', { href: '#/operations?view=jobs' }, 'Inspect jobs or retry a failed job'));
+        if (jobs.some(j => ['pending', 'leased'].includes(j.state))) polling = true;
+        else {
+          if (polling && jobs.some(j => j.state === 'dead')) message.textContent = 'Backfill stopped. Inspect the failed embedding job below.';
+          else if (polling && covered) message.textContent = 'Backfill complete. All current memories have vectors.';
+          polling = false;
+        }
+      } catch (e) {
+        if (active()) { polling = false; jobsView.replaceChildren(h('p', { class: 'error-message', role: 'alert' }, 'Job status unavailable: ' + e.message)); }
+      }
+    } catch (e) {
+      if (active()) { polling = false; message.textContent = 'Embedding status failed: ' + e.message; }
+    } finally {
+      busy = false;
+      if (active()) {
+        refreshButton.disabled = false;
+        if (polling) timer = setTimeout(refresh, 2000);
+      }
+    }
+  }
+
+  page(root, 'Embeddings', 'Make existing memories searchable by meaning, and inspect the actual coverage.',
+    h('section', { class: 'card' }, summary, h('div', { class: 'row' }, backfill, refreshButton), message),
+    modelsView, h('section', { class: 'card' }, jobsView),
+    h('details', { class: 'card' }, h('summary', null, 'Provider configuration & semantic search'),
+      h('p', null, 'Ollama uses /api/embed. OpenAI-compatible endpoints also support LM Studio, vLLM, TEI and LiteLLM. Configure providers on the server; model downloads are never automatic.'),
+      h('p', null, 'Local CPU query embedding can exceed the default 50 ms retrieval budget. Set a suitable tenant policy and inspect the actual strategy trace in ', h('a', { href: '#/workspace?view=search' }, 'Search'), '.'),
       pre({ embedder: { use: 'ollama', ollama: { base_url: 'http://127.0.0.1:11434', model: 'nomic-embed-text', dims: 768,
-        query_prefix: 'search_query: ', document_prefix: 'search_document: ', keep_alive: '10m' } } }),
-      h('p', { class: 'muted' }, 'The repository guide docs/embeddings.md covers other providers, model revisions, query budgets, and authentication.')),
-    h('div', { class: 'card' }, h('h2', null, 'Declare a model'),
-      h('p', { class: 'muted' }, 'Add to vector_models in Tenants & settings, e.g. {"id": "clip-vit-b32@1", "dims": 512, "modalities": ["text","image"]}. Vectors of undeclared models or wrong dimensions are rejected.')));
+        id: 'ollama/nomic-embed-text@1', query_prefix: 'search_query: ', document_prefix: 'search_document: ', keep_alive: '10m' } } })));
+  await refresh();
 }

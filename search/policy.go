@@ -45,7 +45,7 @@ type Policy struct {
 var Default = map[string]Policy{
 	"default": {Name: "default", Fusion: "additive", Lexical: 1, Vector: 1, Entity: 0.5,
 		PriorShare: 0.2, Recency: 1, Confidence: 1, Importance: 1, RecencyHalfLife: 30 * 24 * time.Hour,
-		RRFK: 60, MMRLambda: 0.7, EmbedBudget: 50 * time.Millisecond, Overfetch: 4, GraphHops: 1},
+		RRFK: 60, MMRLambda: 0.7, EmbedBudget: 30 * time.Second, Overfetch: 4, GraphHops: 1},
 	"fast": {Name: "fast", Fusion: "additive", Lexical: 1, Vector: 1, Entity: 0.5,
 		PriorShare: 0.2, Recency: 1, Confidence: 1, Importance: 1, RecencyHalfLife: 30 * 24 * time.Hour,
 		RRFK: 60, MMRLambda: 1, Overfetch: 2, GraphHops: 1},
@@ -54,7 +54,7 @@ var Default = map[string]Policy{
 		RRFK: 60, MMRLambda: 1, Overfetch: 2},
 	"deep": {Name: "deep", Fusion: "additive", Lexical: 1, Vector: 1.2, Entity: 0.5,
 		PriorShare: 0.15, Recency: 1, Confidence: 1, Importance: 1, RecencyHalfLife: 90 * 24 * time.Hour,
-		RRFK: 60, MMRLambda: 0.6, EmbedBudget: 500 * time.Millisecond, Overfetch: 8, GraphHops: 2},
+		RRFK: 60, MMRLambda: 0.6, EmbedBudget: 60 * time.Second, Overfetch: 8, GraphHops: 2},
 }
 
 // bm25Sigmoid squashes a raw BM25 score into [0,1]. Longer queries produce

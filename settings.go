@@ -34,7 +34,8 @@ type Settings struct {
 }
 
 type KnowledgePolicy struct {
-	Mode string `json:"mode,omitempty"`
+	Extraction *knowledge.ExtractionProfile `json:"extraction,omitempty"`
+	Mode       string                       `json:"mode,omitempty"`
 	// Planner selects a server-registered runtime profile. Without runtime
 	// profiles, Mode can only narrow the startup permissions.
 	Planner       string `json:"planner,omitempty"`
@@ -55,6 +56,9 @@ func (e *Engine) knowledgeOptions(ctx context.Context, tenant string) (Knowledge
 		if p.Planner != "" {
 			o.Planner = e.o.KnowledgePlanners[p.Planner]
 		}
+		if p.Extraction != nil {
+			o.Extraction = p.Extraction
+		}
 		if p.Mode != "" {
 			o.Mode = p.Mode
 		}
@@ -72,6 +76,11 @@ func (e *Engine) validateKnowledgePolicy(p *KnowledgePolicy) error {
 	if p == nil {
 		return nil
 	}
+	if p.Extraction != nil {
+		if err := p.Extraction.Validate(); err != nil {
+			return err
+		}
+	}
 	o := e.o.Knowledge
 	if p.Mode != "" && (knowledgeModeRank(p.Mode) < 0 ||
 		len(e.o.KnowledgePlanners) == 0 && knowledgeModeRank(p.Mode) > knowledgeModeRank(o.Mode)) ||
@@ -87,16 +96,19 @@ func (e *Engine) validateKnowledgePolicy(p *KnowledgePolicy) error {
 
 // KnowledgeConfiguration exposes no credentials or provider endpoints.
 type KnowledgeConfiguration struct {
-	Mode                 string `json:"mode"`
-	Provider             string `json:"provider"`
-	Model                string `json:"model,omitempty"`
-	MaxCandidates        int    `json:"max_candidates"`
-	MaxGraphHops         int    `json:"max_graph_hops"`
-	TimeoutMS            int64  `json:"timeout_ms"`
-	Fallback             bool   `json:"fallback"`
-	Consolidation        bool   `json:"consolidation"`
-	Admission            bool   `json:"admission"`
-	BackgroundEnrichment bool   `json:"background_enrichment"`
+	Extraction           knowledge.ExtractionProfile `json:"extraction"`
+	ExtractionSchema     json.RawMessage             `json:"extraction_schema"`
+	Mode                 string                      `json:"mode"`
+	Provider             string                      `json:"provider"`
+	Model                string                      `json:"model,omitempty"`
+	MaxCandidates        int                         `json:"max_candidates"`
+	MaxGraphHops         int                         `json:"max_graph_hops"`
+	TimeoutMS            int64                       `json:"timeout_ms"`
+	Fallback             bool                        `json:"fallback"`
+	Consolidation        bool                        `json:"consolidation"`
+	Admission            bool                        `json:"admission"`
+	BackgroundEnrichment bool                        `json:"background_enrichment"`
+	ExtractionMode       string                      `json:"extraction_mode,omitempty"`
 }
 
 type KnowledgeConfigurationReport struct {
@@ -107,7 +119,7 @@ type KnowledgeConfigurationReport struct {
 	Profiles  map[string]KnowledgeConfiguration `json:"profiles"`
 }
 
-func describeKnowledge(o KnowledgeOptions) KnowledgeConfiguration {
+func describeKnowledge(o KnowledgeOptions) (KnowledgeConfiguration, error) {
 	provider, model := fmt.Sprintf("%T", o.Planner), ""
 	if o.Planner == nil {
 		provider = "deterministic"
@@ -116,8 +128,21 @@ func describeKnowledge(o KnowledgeOptions) KnowledgeConfiguration {
 	} else if d, ok := o.Planner.(interface{ KnowledgeProvider() (string, string) }); ok {
 		provider, model = d.KnowledgeProvider()
 	}
-	return KnowledgeConfiguration{o.Mode, provider, model, o.MaxCandidates, o.MaxGraphHops,
-		o.Timeout.Milliseconds(), o.Fallback, o.Consolidation, o.Admission != nil, o.BackgroundEnrichment}
+	profile, err := knowledge.EffectiveExtractionProfile(o.Extraction)
+	if err != nil {
+		return KnowledgeConfiguration{}, err
+	}
+	schema, err := knowledge.ExtractionJSONSchema(&profile)
+	if err != nil {
+		return KnowledgeConfiguration{}, err
+	}
+	extractionMode := ""
+	if d, ok := o.Planner.(interface{ KnowledgeExtractionMode() string }); ok {
+		extractionMode = d.KnowledgeExtractionMode()
+	}
+	return KnowledgeConfiguration{Mode: o.Mode, Provider: provider, Model: model, MaxCandidates: o.MaxCandidates, MaxGraphHops: o.MaxGraphHops,
+		TimeoutMS: o.Timeout.Milliseconds(), Fallback: o.Fallback, Consolidation: o.Consolidation, Admission: o.Admission != nil, BackgroundEnrichment: o.BackgroundEnrichment,
+		Extraction: profile, ExtractionSchema: schema, ExtractionMode: extractionMode}, nil
 }
 
 // KnowledgeConfiguration returns effective tenant permissions and registered
@@ -135,9 +160,21 @@ func (e *Engine) KnowledgeConfiguration(ctx context.Context, tenant string) (Kno
 	for name, planner := range e.o.KnowledgePlanners {
 		o := e.o.Knowledge
 		o.Planner = planner
-		profiles[name] = describeKnowledge(o)
+		description, err := describeKnowledge(o)
+		if err != nil {
+			return KnowledgeConfigurationReport{}, err
+		}
+		profiles[name] = description
 	}
-	return KnowledgeConfigurationReport{describeKnowledge(e.o.Knowledge), describeKnowledge(effective), settings.Knowledge,
+	startup, err := describeKnowledge(e.o.Knowledge)
+	if err != nil {
+		return KnowledgeConfigurationReport{}, err
+	}
+	description, err := describeKnowledge(effective)
+	if err != nil {
+		return KnowledgeConfigurationReport{}, err
+	}
+	return KnowledgeConfigurationReport{startup, description, settings.Knowledge,
 		len(profiles) != 0, profiles}, nil
 }
 

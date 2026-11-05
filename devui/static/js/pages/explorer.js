@@ -1,9 +1,20 @@
 import { state, call, h, page, badge, date, short, status, guard, toast } from '../lib.js';
 import { connections } from '../explorer-model.js';
 import { workspaceSession } from '../knowledge-ui.js';
+import { tenantCleanup } from '../tenant-cleanup.js';
 
 const palette = { entity: '#14b8a6', version: '#f5ad55', explicit: '#60a5fa', knowledge: '#83d879', inferred: '#b8a0ff', semantic: '#f18fb8' };
 const NS = 'http://www.w3.org/2000/svg';
+function originLabel(m) {
+  if (m.source?.kind === 'media_interpreted') return 'Media interpretation · unreviewed';
+  if (m.source?.kind === 'document') return 'Imported document chunk';
+  if (m.source?.kind === 'knowledge_enriched') {
+    return m.metadata?.enrichment?.review === 'unreviewed' ? 'Model extraction · unreviewed' : 'Model extraction';
+  }
+  if (m.source?.kind === 'explicit') return m.metadata?.assertion ? 'Saved assertion' : 'Original input';
+  return 'Stored memory';
+}
+
 function svg(tag, attrs, ...children) {
   const el = document.createElementNS(NS, tag);
   Object.entries(attrs).forEach(([key, value]) => el.setAttribute(key, value));
@@ -44,17 +55,23 @@ function network(memories, links, selected, pick) {
 export default async function (root, [initialID]) {
   const active = workspaceSession(root);
   let offset = 0, data, selected = initialID || '', semanticLinks = [], showInferred = true;
-  let generation = 0, showHistory = false;
+  const cursors = [''];
+  let generation = 0, showHistory = false, deleting = false;
   const query = h('input', { placeholder: 'Filter this slice by text, entity, or slot', 'aria-label': 'Filter memories', class: 'grow' });
   const user = h('input', { placeholder: 'user_id (optional)', 'aria-label': 'User scope' });
-  const stage = h('div'), detail = h('div', { class: 'card inspector' }), metrics = h('div', { class: 'stats-grid' });
+  const stage = h('div'), detail = h('section', { class: 'card inspector', tabindex: -1, 'aria-label': 'Selected memory' }), metrics = h('div', { class: 'stats-grid' });
   const count = h('span', { class: 'muted' });
   const listCount = h('p', { class: 'muted' });
   const list = h('div', { class: 'memory-cards' });
-  const previous = h('button', { onclick: guard(async () => { offset = Math.max(0, offset - 100); await load(); }) }, 'Previous slice');
-  const next = h('button', { onclick: guard(async () => { offset += 100; await load(); }) }, 'Next slice');
+  const layout = h('div', { class: 'explorer-layout' }, list, detail);
+  const previous = h('button', { onclick: guard(async () => { offset = Math.max(0, offset - 1); await load(); }) }, 'Previous slice');
+  const next = h('button', { onclick: guard(async () => {
+    const cursor = data.next_cursor || data.memories.at(-1)?.id;
+    if (!data.more || !cursor) return;
+    cursors[offset + 1] = cursor; offset++; await load();
+  }) }, 'Next slice');
   const metric = (label, value, note) => h('div', { class: 'stat' }, h('span', null, label), h('strong', null, value), h('small', null, note));
-  const pick = id => { selected = id; semanticLinks = []; render(); };
+  const pick = id => { selected = id; semanticLinks = []; render(); if (id) detail.focus(); };
   const semantic = guard(async () => {
     const m = data.memories.find(m => m.id === selected);
     if (!m) return;
@@ -76,34 +93,43 @@ export default async function (root, [initialID]) {
       (!m.valid_to || Date.parse(m.valid_to) > Date.now()) && (!m.expires_at || Date.parse(m.expires_at) > Date.now())) &&
       [m.text, m.title, m.slot, ...(m.entities || []).map(e => e.name)].join(' ').toLowerCase().includes(term));
     const nodes = [...matches.filter(m => m.id === selected), ...matches.filter(m => m.id !== selected)].slice(0, 60), ids = new Set(nodes.map(m => m.id));
-    const relationships = (data.relationships || data.inferred_links).filter(l => showInferred || l.origin && l.origin !== 'inferred');
+    const relationships = (data.relationships || data.inferred_links || []).filter(l => showInferred || l.origin && l.origin !== 'inferred');
     const edges = [...connections(nodes, relationships), ...semanticLinks.filter(e => ids.has(e.source_id) && ids.has(e.target_id))].slice(0, 400);
     stage.replaceChildren(nodes.length ? network(nodes, edges, selected, pick) : h('div', { class: 'empty-state' }, h('h2', null, 'No memories in this view'), h('p', null, 'Save facts through MCP or the Add playground, or change the scope/filter.')));
     count.textContent = `${nodes.length} graph nodes · ${edges.length} connections · ${matches.length} matches in this slice. Graph capped at 60 nodes / 400 edges.`;
     listCount.textContent = `${matches.length} memories shown on this page${showHistory ? ', including older versions' : ' (older versions hidden)'}. ${data.more ? 'More pages available.' : 'End of results.'}`;
     metrics.replaceChildren(metric('Memories in slice', data.memories.length, data.more ? 'More available' : 'End of results'),
-      metric('Inferred links', data.inferred_links.length, 'History included; retired edges are dimmed'),
+      metric('Inferred links', (data.inferred_links || []).length, 'History included; retired edges are dimmed'),
       metric('Embedding model', state.info?.capabilities?.embedder || 'Not configured', 'Optional semantic retrieval'),
       metric('Relationship model', state.info?.capabilities?.relationship_inference || 'Not configured', 'Optional background inference'),
       metric('Knowledge intelligence', state.info?.capabilities?.knowledge_mode || 'disabled', 'Validated transitions, separate from inference'));
     list.replaceChildren(...(matches.length ? matches.map(m => h('button', { class: 'memory-tile ' + (selected === m.id ? 'selected' : ''), onclick: () => pick(m.id) },
       h('strong', null, m.title || m.text.slice(0, 150)),
+      h('small', null, originLabel(m)),
       h('span', { class: 'row' }, status(m), h('small', null, m.user_id || 'No project', ' · Version ', m.version)),
       h('small', null, 'Learned ', date(m.recorded_at)))) : [
         h('div', { class: 'empty-state' }, h('h2', null, 'No matching memories here'),
           h('p', null, 'Try another filter, include older versions or add a memory.'),
           h('a', { href: '#/intelligence' }, 'Try a memory'))]));
     const m = data.memories.find(m => m.id === selected);
+    detail.hidden = !m;
+    layout.setAttribute('class', 'explorer-layout' + (m ? ' has-selection' : ''));
     if (!m) {
-      detail.replaceChildren(h('h2', null, 'Choose a memory'),
-        h('p', { class: 'muted' }, 'Select a card to read it, see connected memories, or suggest a correction.'),
-        h('p', null, 'Want to see how the model works?'),
-        h('a', { href: '#/intelligence' }, 'Try a memory without saving it'));
+      detail.replaceChildren();
       return;
     }
     const linked = [...connections(data.memories, relationships), ...semanticLinks].filter(e => e.source_id === m.id || e.target_id === m.id);
-    detail.replaceChildren(...[h('div', { class: 'eyebrow' }, 'Memory inspector'), h('h2', null, m.title || short(m.id)),
-      h('p', null, m.text), h('p', null, status(m), badge(m.kind), badge(`v${m.version}`)),
+    detail.replaceChildren(...[h('div', { class: 'row' }, h('span', { class: 'eyebrow' }, 'Memory inspector'),
+      h('button', { onclick: () => { pick(''); list.querySelector('button')?.focus(); } }, 'Close details')),
+      h('h2', null, m.title || short(m.id)),
+      h('p', null, m.text), h('p', null, badge(originLabel(m)), status(m), badge(m.kind), badge(`v${m.version}`)),
+      m.source?.kind === 'document' ? h('p', { class: 'muted' }, `${m.metadata?.filename || 'Document'} · page ${m.metadata?.page || '?'} · chunk ${m.metadata?.chunk || '?'}`) : null,
+      m.source?.kind === 'media_interpreted' ? h('p', { class: 'muted' }, `${m.metadata?.filename || 'Media'} · Model: ${m.source.derived_by || 'not reported'}. This is a model interpretation, not verified evidence. The original media is retained separately.`) : null,
+      m.source?.kind === 'knowledge_enriched' ? h('p', { class: 'muted' },
+        'This is a model interpretation, not a second manual save. The original input is kept separately as evidence, even when the text is identical.',
+        m.source.derived_by ? ` Model: ${m.source.derived_by}.` : '') : null,
+      m.source?.kind === 'knowledge_enriched' && m.metadata?.enrichment?.source_id
+        ? h('a', { href: '#/memory/' + encodeURIComponent(m.metadata.enrichment.source_id) }, 'Read original input') : null,
       m.subject ? h('p', { class: 'relation-triple' }, `${m.subject} → ${m.metadata?.assertion?.conditions?.polarity === 'negative' ? 'NOT ' : ''}${m.predicate} → ${m.object}`) : null,
       m.metadata?.assertion ? h('p', null, badge(m.metadata.assertion.epistemic_type || 'assertion')) : null,
       m.metadata?.decision ? h('p', null, badge(m.metadata.decision.status || 'unresolved'),
@@ -111,10 +137,32 @@ export default async function (root, [initialID]) {
       h('a', { href: '#/memory/' + m.id }, 'Read evidence & version history'),
       h('div', { class: 'row' },
         h('a', { href: '#/knowledge-state/' + encodeURIComponent(m.id) }, 'What else is known?'),
-        h('a', { href: '#/intelligence/' + encodeURIComponent(m.id) }, 'Suggest a correction')),
+        h('a', { href: '#/intelligence/' + encodeURIComponent(m.id) }, 'Suggest a correction'),
+        h('button', { class: 'danger', disabled: deleting, onclick: async () => {
+          if (!active() || deleting) return;
+          if (!confirm('Permanently delete this memory?\n\n' + m.text.slice(0, 200) +
+            '\n\nThis removes this record, not every related memory. To preserve it as history, use Invalidate in the full details page.')) return;
+          if (!active()) return;
+          deleting = true; render();
+          try {
+            await call('DELETE', '/v1/memories/' + encodeURIComponent(m.id));
+            if (!active()) return;
+            if (initialID === m.id) initialID = '';
+            if (selected === m.id) selected = '';
+            data.memories = data.memories.filter(item => item.id !== m.id);
+            render();
+            toast('Memory deleted');
+            await load();
+            if (active() && !selected) list.querySelector('button')?.focus();
+          } finally {
+            deleting = false;
+            if (active()) render();
+          }
+        } }, deleting ? 'Deleting memory…' : 'Delete memory')),
       h('details', null, h('summary', null, 'Advanced: semantic search'),
         h('button', { onclick: semantic }, 'Find vector neighbors'),
         h('p', { class: 'muted' }, 'Requires a configured embedder. Results are not proof that two claims are equivalent.')),
+      m.metadata?.document_id ? h('p', null, h('a', { href: '#/documents/' + encodeURIComponent(m.metadata.document_id) }, 'Open source document, file preview and lineage')) : null,
       h('h2', null, `${linked.length} connections on this page`),
       linked.length ? null : h('p', { class: 'muted' }, 'No connections returned on this page. This is not a full database search.'),
       ...linked.map(edge => {
@@ -132,9 +180,9 @@ export default async function (root, [initialID]) {
   async function load() {
     if (!active()) return;
     const token = ++generation;
-    const result = await call('GET', `/v1/explore?all_versions=true&limit=100&offset=${offset}&user_id=${encodeURIComponent(user.value.trim())}`);
+    const result = await call('GET', `/v1/explore?all_versions=true&show_expired=true&limit=100&before_id=${encodeURIComponent(cursors[offset] || '')}&user_id=${encodeURIComponent(user.value.trim())}`);
     if (!active() || token !== generation) return;
-    data = result;
+    data = { ...result, memories: result.memories ?? [], inferred_links: result.inferred_links ?? [] };
     if (initialID && offset === 0 && !data.memories.some(m => m.id === initialID)) {
       const focused = await call('GET', '/v1/memories/' + encodeURIComponent(initialID));
       if (!user.value.trim() || focused.user_id === user.value.trim()) {
@@ -161,7 +209,7 @@ export default async function (root, [initialID]) {
   page(root, 'Your memories', 'Read what has been remembered. Select a card to understand its history and connections.',
     h('div', { class: 'card' }, h('div', { class: 'row' }, query, user, h('button', { onclick: guard(async () => { offset = 0; await load(); }) }, 'Apply scope / refresh'),
       h('label', { class: 'check' }, historyToggle, 'Include older versions'))),
-    listCount, h('div', { class: 'explorer-layout' }, list, detail),
+    listCount, layout,
     h('div', { class: 'row' }, previous, next),
     h('details', { class: 'card' }, h('summary', null, 'Explore connections as a graph'),
       h('p', { class: 'muted' }, 'Model-inferred links are estimates, not confirmed facts. Entity paths are navigation clues. The graph shows only this page, with at most 60 nodes and 400 edges.'),
@@ -173,6 +221,7 @@ export default async function (root, [initialID]) {
         if (!active()) return;
         await call('POST', '/v1/relationships/backfill'); toast('Relationship backfill queued. Monitor Jobs for progress and failures.');
       }) }, 'Backfill inferred relationships'),
-      h('a', { href: '#/jobs' }, 'View background jobs')));
+      h('a', { href: '#/jobs' }, 'View background jobs')),
+    tenantCleanup(active, async () => { selected = ''; offset = 0; await load(); }));
   await load();
 }

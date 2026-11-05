@@ -3,6 +3,8 @@ go 1.23.0
 use (
 	.
 	./cmd/niromem
+	./connectors/documents
+	./connectors/multimodal
 	./connectors/niro
 	./connectors/inference
 	./connectors/knowledge

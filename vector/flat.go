@@ -27,7 +27,7 @@ func (t *TopK) Push(h Hit) {
 		heap.Push(&t.h, h)
 		return
 	}
-	if h.Score > t.h[0].Score {
+	if worseHit(t.h[0], h) {
 		t.h[0] = h
 		heap.Fix(&t.h, 0)
 	}
@@ -46,7 +46,7 @@ func (t *TopK) Sorted() []Hit {
 type hitHeap []Hit // min-heap on Score
 
 func (h hitHeap) Len() int           { return len(h) }
-func (h hitHeap) Less(i, j int) bool { return h[i].Score < h[j].Score }
+func (h hitHeap) Less(i, j int) bool { return worseHit(h[i], h[j]) }
 func (h hitHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
 func (h *hitHeap) Push(x any)        { *h = append(*h, x.(Hit)) }
 func (h *hitHeap) Pop() any {
@@ -54,6 +54,13 @@ func (h *hitHeap) Pop() any {
 	x := old[len(old)-1]
 	*h = old[:len(old)-1]
 	return x
+}
+
+func worseHit(a, b Hit) bool {
+	if a.Score != b.Score {
+		return a.Score < b.Score
+	}
+	return a.Target.Key() < b.Target.Key()
 }
 
 // Flat is an exact, in-process brute-force Index. It suits tests and small
@@ -68,6 +75,18 @@ type Flat struct {
 func NewFlat() *Flat { return &Flat{points: map[string]map[string]Point{}} }
 
 func space(tenant, model string) string { return tenant + "\x00" + model }
+
+// PurgeTenant removes every model space belonging to tenant.
+func (f *Flat) PurgeTenant(_ context.Context, tenant string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for key := range f.points {
+		if strings.HasPrefix(key, tenant+"\x00") {
+			delete(f.points, key)
+		}
+	}
+	return nil
+}
 
 // Upsert stores normalized copies of the points.
 func (f *Flat) Upsert(_ context.Context, points []Point) error {

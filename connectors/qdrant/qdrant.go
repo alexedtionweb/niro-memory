@@ -193,6 +193,33 @@ func match(key, value string) map[string]any {
 	return map[string]any{"key": key, "match": map[string]any{"value": value}}
 }
 
+// PurgeTenant deletes one tenant by server-side filter in each model collection.
+func (x *Index) PurgeTenant(ctx context.Context, tenant string) error {
+	if tenant == "" {
+		return fmt.Errorf("qdrant: tenant required")
+	}
+	var list struct {
+		Result struct {
+			Collections []struct {
+				Name string `json:"name"`
+			} `json:"collections"`
+		} `json:"result"`
+	}
+	if err := x.call(ctx, "GET", "/collections", nil, &list); err != nil {
+		return err
+	}
+	for _, c := range list.Result.Collections {
+		if !strings.HasPrefix(c.Name, x.o.Prefix) {
+			continue
+		}
+		if err := x.call(ctx, "POST", "/collections/"+c.Name+"/points/delete?wait=true",
+			map[string]any{"filter": map[string]any{"must": []any{match("tenant", tenant)}}}, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Delete removes the targets of a tenant from every collection of this prefix.
 func (x *Index) Delete(ctx context.Context, tenant string, targets []vector.Target) error {
 	if len(targets) == 0 {

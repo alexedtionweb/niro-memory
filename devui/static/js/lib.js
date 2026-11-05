@@ -1,5 +1,5 @@
 // Small helpers shared by all pages: API calls, DOM building, formatting.
-// No framework: pages build DOM with h() and re-render on demand.
+// HTMX owns workspace fragments; inspector modules share these DOM helpers.
 
 export const state = {
   get tenant() { return localStorage.getItem('niromem.tenant') || 'dev'; },
@@ -9,7 +9,7 @@ export const state = {
   info: null,
 };
 
-function headers(json) {
+export function requestHeaders(json) {
   const h = {};
   if (json) h['Content-Type'] = 'application/json';
   if (state.key) h['Authorization'] = 'Bearer ' + state.key;
@@ -19,7 +19,7 @@ function headers(json) {
 
 // call performs an API request and returns parsed JSON or throws.
 export async function call(method, path, body) {
-  const res = await fetch(path, { method, headers: headers(body !== undefined), body: body === undefined ? undefined : JSON.stringify(body) });
+  const res = await fetch(path, { method, headers: requestHeaders(body !== undefined), body: body === undefined ? undefined : JSON.stringify(body) });
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
@@ -29,7 +29,7 @@ export async function call(method, path, body) {
 
 // blobURL fetches a stored part with credentials and returns an object URL.
 export async function blobURL(sha) {
-  const res = await fetch('/v1/blobs/' + sha, { headers: headers(false) });
+  const res = await fetch('/v1/blobs/' + sha, { headers: requestHeaders(false) });
   if (!res.ok) throw new Error('blob ' + res.status);
   return URL.createObjectURL(await res.blob());
 }
@@ -39,7 +39,10 @@ export function h(tag, attrs, ...kids) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
     if (v === undefined || v === null || v === false) continue;
-    if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    if (k.startsWith('on')) {
+      if (typeof v !== 'function') throw new TypeError('Event handler must be a function: ' + k);
+      el.addEventListener(k.slice(2), guard(v));
+    }
     else if (k === 'value') el.value = v;
     else if (k === 'checked') el.checked = v;
     else el.setAttribute(k, v === true ? '' : v);
@@ -72,10 +75,10 @@ export function guard(fn) {
 }
 
 export function table(cols, rows, onRow) {
-  return h('table', null,
+  return h('div', { class: 'table-scroll', tabindex: 0, 'aria-label': 'Scrollable data table' }, h('table', null,
     h('thead', null, h('tr', null, cols.map((c) => h('th', null, c.label)))),
     h('tbody', null, rows.map((r) => h('tr', { class: onRow ? 'click' : '', onclick: onRow && (() => onRow(r)) },
-      cols.map((c) => h('td', null, c.render ? c.render(r) : fmt(r[c.key])))))));
+      cols.map((c) => h('td', null, c.render ? c.render(r) : fmt(r[c.key]))))))));
 }
 
 export function fmt(v) {

@@ -26,6 +26,12 @@ type Store interface {
 	Delete(ctx context.Context, tenant, sha256 string) error
 }
 
+// TenantPurger deletes at most limit original blobs per call, including orphans.
+// done is true only after the tenant namespace has been exhausted.
+type TenantPurger interface {
+	PurgeTenantBatch(context.Context, string, int) (deleted int, done bool, err error)
+}
+
 // Ref computes the content address of data.
 func Ref(data []byte, mime string) memory.BlobRef {
 	sum := sha256.Sum256(data)

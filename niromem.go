@@ -39,6 +39,8 @@ import (
 
 // Options wires an Engine. Only Store is required.
 type Options struct {
+	Documents DocumentParser
+	Media     MediaInterpreter
 	// Store is the source of truth (connectors/sqlite, connectors/postgres, …).
 	Store store.Store
 	// Vector is an external vector index (e.g. Qdrant). When nil, the
@@ -117,6 +119,11 @@ func Open(o Options) (*Engine, error) {
 	if o.Knowledge.Mode == "" {
 		o.Knowledge.Mode = "disabled"
 	}
+	profile, err := knowledge.EffectiveExtractionProfile(o.Knowledge.Extraction)
+	if err != nil {
+		return nil, err
+	}
+	o.Knowledge.Extraction = &profile
 	switch o.Knowledge.Mode {
 	case "disabled", "shadow", "enforced":
 	default:
@@ -151,7 +158,7 @@ func Open(o Options) (*Engine, error) {
 	}
 	if o.Knowledge.MaxCandidates < 1 || o.Knowledge.MaxCandidates > 64 ||
 		o.Knowledge.MaxGraphHops < 1 || o.Knowledge.MaxGraphHops > 4 ||
-		o.Knowledge.Timeout <= 0 || o.Knowledge.Timeout > 2*time.Minute {
+		o.Knowledge.Timeout <= 0 || o.Knowledge.Timeout > 30*time.Minute {
 		return nil, errors.New("niromem: invalid knowledge lookup bounds")
 	}
 	if o.Limits == (memory.Limits{}) {
@@ -210,6 +217,8 @@ type Capabilities struct {
 	External             bool   `json:"external_vector_index"`
 	Embedder             string `json:"embedder,omitempty"`
 	Blob                 bool   `json:"blob"`
+	DocumentImport       bool   `json:"document_import"`
+	MediaInterpretation  string `json:"media_interpretation,omitempty"`
 	Rules                string `json:"rules,omitempty"`
 	Relationships        string `json:"relationship_inference,omitempty"`
 	KnowledgeMode        string `json:"knowledge_mode"`
@@ -219,9 +228,12 @@ type Capabilities struct {
 // Capabilities reports the features available with the configured connectors.
 func (e *Engine) Capabilities() Capabilities {
 	c := Capabilities{Vector: e.index != nil, External: e.external, Blob: e.o.Blob != nil, KnowledgeMode: e.o.Knowledge.Mode,
-		BackgroundEnrichment: e.o.Knowledge.BackgroundEnrichment}
+		BackgroundEnrichment: e.o.Knowledge.BackgroundEnrichment, DocumentImport: e.o.Documents != nil && e.o.Blob != nil}
 	_, c.Lexical = e.o.Store.(store.Lexical)
 	_, c.Entities = e.o.Store.(store.Entities)
+	if e.o.Media != nil {
+		c.MediaInterpretation = e.o.Media.Name()
+	}
 	if d, ok := e.o.Store.(store.Describer); ok {
 		c.BM25 = d.Capabilities().BM25
 	}
@@ -258,13 +270,22 @@ const (
 // (go w.Run(ctx)), in a separate `niromem worker` process, or call RunOnce
 // from a serverless function.
 func (e *Engine) Worker() *jobs.Runner {
-	return &jobs.Runner{Queue: e.o.Store, Logger: e.o.Logger, Now: e.o.Now,
+	timeout := max(5*time.Minute, 3*e.o.Knowledge.Timeout+time.Minute)
+	if e.o.Media != nil {
+		timeout = max(timeout, 11*time.Minute)
+	}
+	return &jobs.Runner{Queue: e.o.Store, Logger: e.o.Logger, Now: e.o.Now, Timeout: timeout,
 		Observe: func(kind string, took time.Duration, err error) {
 			if e.o.Observer != nil {
 				e.o.Observer.Observe("job."+kind, took, err)
 			}
 		},
 		Handlers: map[string]jobs.Handler{
+			store.JobTenantPurge:    e.handleTenantPurge,
+			JobDocumentImport:       e.handleDocumentImport,
+			JobDocumentReprocess:    e.handleDocumentReprocess,
+			JobDocumentRepair:       e.handleDocumentRepair,
+			JobMediaInterpret:       e.handleDocumentImport,
 			JobProcess:              e.handleProcess,
 			JobRederive:             e.handleRederive,
 			JobEmbed:                e.handleEmbed,

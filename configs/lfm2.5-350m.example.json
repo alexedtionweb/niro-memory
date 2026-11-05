@@ -1,0 +1,45 @@
+{
+  "env": "development",
+  "listen": "127.0.0.1:8080",
+  "store": {"use": "sqlite", "sqlite": {"path": "niromem.db"}},
+  "blob": {"use": "dir", "dir": {"path": "blobs"}},
+  "auth": {"dev": true},
+  "worker": {"inline": true, "concurrency": 4},
+  "documents": {"enabled": true, "concurrency": 4},
+  "embedder": {
+    "use": "ollama",
+    "ollama": {
+      "base_url": "http://127.0.0.1:11434",
+      "model": "embeddinggemma-2:440m",
+      "dims": 768,
+      "id": "ollama/embeddinggemma-2:440m-chunk1024-mean@1",
+      "chunk_size": 1024,
+      "query_prefix": "task: search result | query: ",
+      "document_prefix": "title: none | text: ",
+      "keep_alive": "10m",
+      "timeout_ms": 600000,
+      "truncate": false
+    }
+  },
+  "knowledge": {
+    "mode": "enforced",
+    "background_enrichment": true,
+    "planner": {
+      "use": "ollama",
+      "ollama": {
+        "base_url": "http://127.0.0.1:11434",
+        "model": "qwen3.5:2b",
+        "think": false,
+        "timeout_ms": 1260000,
+        "num_thread": 4,
+        "num_ctx": 8192,
+        "num_predict": 1536,
+        "extractive_only": false
+      }
+    },
+    "max_candidates": 8,
+    "max_graph_hops": 2,
+    "timeout_ms": 1200000,
+    "fallback": false
+  }
+}

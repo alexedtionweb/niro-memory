@@ -23,11 +23,13 @@ import (
 
 // Store is a thread-safe in-memory store. The zero value is not usable.
 type Store struct {
-	mu      sync.RWMutex
-	now     func() time.Time
-	tenants map[string]*tenant
-	jobs    map[string]*store.Job
-	vec     *vector.Flat
+	mu            sync.RWMutex
+	now           func() time.Time
+	tenants       map[string]*tenant
+	jobs          map[string]*store.Job
+	purges        map[string]*store.PurgeStatus
+	purgeRequests map[string]map[string]string
+	vec           *vector.Flat
 }
 
 type tenant struct {
@@ -54,7 +56,7 @@ func New(now func() time.Time) *Store {
 	if now == nil {
 		now = time.Now
 	}
-	return &Store{now: now, tenants: map[string]*tenant{}, jobs: map[string]*store.Job{}, vec: vector.NewFlat()}
+	return &Store{now: now, tenants: map[string]*tenant{}, jobs: map[string]*store.Job{}, purges: map[string]*store.PurgeStatus{}, purgeRequests: map[string]map[string]string{}, vec: vector.NewFlat()}
 }
 
 func (s *Store) t(name string) *tenant {
@@ -92,6 +94,9 @@ func (s *Store) Write(_ context.Context, b *store.Batch) (*store.Receipt, error)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if p := s.purges[b.Tenant]; p != nil && p.State != "complete" {
+		return nil, conflict("tenant cleanup is in progress; writes are locked")
+	}
 	t := s.t(b.Tenant)
 	now := s.now()
 	if b.OperationKey != "" {
@@ -280,8 +285,26 @@ func (s *Store) Write(_ context.Context, b *store.Batch) (*store.Receipt, error)
 
 // check validates every conditional change of b without mutating anything.
 func (s *Store) check(t *tenant, b *store.Batch) error {
+	for _, j := range b.Jobs {
+		if err := store.ValidateJobPriority(j.Priority); err != nil {
+			return err
+		}
+	}
 	for _, c := range b.Checks {
 		m := t.mems[c.ID]
+		if c.NoMatch != nil {
+			f := *c.NoMatch
+			if err := f.Check(); err != nil {
+				return err
+			}
+			for _, existing := range t.mems {
+				withEntities := t.withEntities(existing)
+				if f.Match(&withEntities) {
+					return conflict("memory set changed")
+				}
+			}
+			continue
+		}
 		if m == nil || m.Version != c.Version || (c.Open && !store.Open(m)) {
 			return conflict("memory %s changed", c.ID)
 		}
@@ -830,7 +853,7 @@ func (s *Store) Missing(_ context.Context, tenant, model string, limit int) ([]v
 	var ids []string
 	for id, m := range t.mems {
 		tg := vector.Target{Kind: vector.TargetMemory, ID: id}
-		if _, ok := t.vectors[model][tg.Key()]; !ok && store.Open(m) {
+		if _, ok := t.vectors[model][tg.Key()]; !ok && store.Open(m) && m.Source.Kind != "document_manifest" {
 			ids = append(ids, id)
 		}
 	}
@@ -852,7 +875,7 @@ func (s *Store) Coverage(_ context.Context, tenant, model string) (int, int, err
 	}
 	have, total := 0, 0
 	for id, m := range t.mems {
-		if !store.Open(m) {
+		if !store.Open(m) || m.Source.Kind == "document_manifest" {
 			continue
 		}
 		total++
@@ -919,6 +942,9 @@ func (s *Store) Claim(_ context.Context, worker string, n int, lease time.Durati
 	for _, j := range s.jobs {
 		due := (j.State == store.JobPending && !j.NotBefore.After(now)) ||
 			(j.State == store.JobLeased && !j.LeaseUntil.After(now))
+		if p := s.purges[j.Tenant]; j.Kind != "tenant.purge" && p != nil && p.State != "complete" {
+			continue
+		}
 		if due && !busy[j.Tenant+"\x00"+j.Kind+"\x00"+j.Key] {
 			perTenant[j.Tenant] = append(perTenant[j.Tenant], j)
 		}
@@ -926,6 +952,9 @@ func (s *Store) Claim(_ context.Context, worker string, n int, lease time.Durati
 	tenants := make([]string, 0, len(perTenant))
 	for tn, js := range perTenant {
 		sort.Slice(js, func(a, b int) bool {
+			if js[a].Priority != js[b].Priority {
+				return js[a].Priority > js[b].Priority
+			}
 			if !js[a].NotBefore.Equal(js[b].NotBefore) {
 				return js[a].NotBefore.Before(js[b].NotBefore)
 			}
@@ -952,7 +981,7 @@ func (s *Store) Claim(_ context.Context, worker string, n int, lease time.Durati
 			}
 			j.State, j.Worker, j.LeaseUntil, j.UpdatedAt = store.JobLeased, worker, now.Add(lease), now
 			j.Attempts++
-			out = append(out, *j)
+			out = append(out, cloneJob(*j))
 			took = true
 		}
 		if !took {
@@ -999,8 +1028,12 @@ func (s *Store) Finish(_ context.Context, id, worker string, r store.Outcome) er
 		delete(s.jobs, id)
 	case r.Dead:
 		j.State, j.LastError, j.Worker, j.UpdatedAt = store.JobDead, r.Error, "", s.now()
+		j.LeaseUntil = time.Time{}
 	default:
 		// Merge a pending duplicate (same key, enqueued while this job ran).
+		if r.Yield && j.Attempts > 0 {
+			j.Attempts--
+		}
 		notBefore := r.RetryAt
 		for oid, o := range s.jobs {
 			if oid != id && j.Key != "" && o.State == store.JobPending && o.Tenant == j.Tenant && o.Kind == j.Kind && o.Key == j.Key {
@@ -1011,6 +1044,7 @@ func (s *Store) Finish(_ context.Context, id, worker string, r store.Outcome) er
 			}
 		}
 		j.State, j.LastError, j.Worker, j.NotBefore, j.UpdatedAt = store.JobPending, r.Error, "", notBefore, s.now()
+		j.LeaseUntil = time.Time{}
 	}
 	return nil
 }
@@ -1020,13 +1054,53 @@ func (s *Store) Jobs(_ context.Context, q store.JobQuery) ([]store.Job, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var out []store.Job
-	for _, j := range s.jobs {
-		if (q.Tenant == "" || j.Tenant == q.Tenant) && (q.State == "" || j.State == q.State) && (q.Kind == "" || j.Kind == q.Kind) && (q.Key == "" || j.Key == q.Key) {
-			out = append(out, *j)
+	add := func(j *store.Job) {
+		if j != nil && j.ID > q.AfterID && (q.Tenant == "" || j.Tenant == q.Tenant) && (q.State == "" || j.State == q.State) && (q.Kind == "" || j.Kind == q.Kind) && (q.Key == "" || j.Key == q.Key) {
+			out = append(out, cloneJob(*j))
+		}
+	}
+	if q.ID != "" {
+		add(s.jobs[q.ID])
+	} else {
+		for _, j := range s.jobs {
+			add(j)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return page(out, 0, q.Limit), nil
+}
+
+// JobControl atomically updates a tenant-scoped job.
+func (s *Store) JobControl(_ context.Context, c store.JobControl) (store.Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := store.Job{}
+	if j := s.jobs[c.ID]; j != nil {
+		current = *j
+	}
+	j, err := store.ApplyJobControl(current, c, s.now())
+	if err != nil {
+		return store.Job{}, err
+	}
+	if j.State == store.JobPending && j.Key != "" {
+		for _, other := range s.jobs {
+			if other.ID != j.ID && other.Tenant == j.Tenant && other.Kind == j.Kind && other.Key == j.Key && other.State == store.JobPending {
+				return store.Job{}, conflict("pending job already owns key %s", j.Key)
+			}
+		}
+	}
+	if c.Action == store.JobDelete {
+		delete(s.jobs, j.ID)
+	} else {
+		s.jobs[j.ID] = &j
+	}
+	return cloneJob(j), nil
+}
+
+func cloneJob(j store.Job) store.Job {
+	j.Payload = append(json.RawMessage(nil), j.Payload...)
+	j.Checkpoint = append(json.RawMessage(nil), j.Checkpoint...)
+	return j
 }
 
 func cloneMem(m *memory.Memory) *memory.Memory {

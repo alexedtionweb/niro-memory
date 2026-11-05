@@ -1,0 +1,52 @@
+{
+  "env": "development",
+  "listen": "127.0.0.1:8080",
+  "store": {"use": "sqlite", "sqlite": {"path": "niromem.db"}},
+  "blob": {"use": "dir", "dir": {"path": "blobs"}},
+  "auth": {"dev": true},
+  "worker": {"inline": true, "concurrency": 4},
+  "documents": {"enabled": true, "concurrency": 4},
+  "multimodal": {
+    "use": "ollama",
+    "ollama": {
+      "base_url": "http://127.0.0.1:11434",
+      "model": "lfm3-omni:latest",
+      "num_thread": 4,
+      "num_ctx": 8192,
+      "num_predict": 384,
+      "timeout_ms": 600000
+    }
+  },
+  "embedder": {
+    "use": "ollama",
+    "ollama": {
+      "base_url": "http://127.0.0.1:11434",
+      "model": "nomic-embed-text",
+      "dims": 768,
+      "id": "ollama/nomic-embed-text@1",
+      "query_prefix": "search_query: ",
+      "document_prefix": "search_document: ",
+      "keep_alive": "10m",
+      "timeout_ms": 600000,
+      "truncate": false
+    }
+  },
+  "knowledge": {
+    "mode": "enforced",
+    "background_enrichment": true,
+    "planner": {
+      "use": "ollama",
+      "ollama": {
+        "base_url": "http://127.0.0.1:11434",
+        "model": "lfm3-omni:latest",
+        "num_thread": 4,
+        "num_ctx": 4096,
+        "num_predict": 1536
+      }
+    },
+    "max_candidates": 8,
+    "max_graph_hops": 2,
+    "timeout_ms": 600000,
+    "fallback": false
+  }
+}

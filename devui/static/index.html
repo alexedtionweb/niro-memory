@@ -4,20 +4,25 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>niromem · memory workspace · dev console</title>
+  <meta name="htmx-config" content='{"allowEval":false,"allowScriptTags":false,"selfRequestsOnly":true,"historyCacheSize":0,"includeIndicatorStyles":false,"timeout":15000}'>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="vendor/pico-2.1.1.min.css">
   <link rel="stylesheet" href="style.css">
+  <script src="vendor/htmx-2.0.8.min.js" defer></script>
   <script type="module" src="js/app.js"></script>
 </head>
 <body>
   <aside>
     <div class="brand">niromem <small>Memory workspace</small></div>
     <nav id="nav" aria-label="Workspace navigation"></nav>
-    <div class="conn">
+    <details class="connection-settings"><summary>Connection settings</summary><div class="conn">
       <label>Tenant <input id="tenant" autocomplete="off"></label>
       <label>API key <input id="key" type="password" placeholder="(dev auth: empty)" autocomplete="off"></label>
       <div id="caps" class="muted"></div>
-    </div>
+    </div></details>
+    <p class="muted sidebar-note">Local developer tools<br>Real data · tenant isolated</p>
   </aside>
-  <main id="main" aria-label="Memory workspace"></main>
+  <main id="main" aria-label="Memory workspace" tabindex="-1"></main>
   <div id="toast" role="status" aria-live="polite"></div>
 </body>
 </html>

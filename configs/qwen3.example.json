@@ -3,7 +3,9 @@
   "listen": "127.0.0.1:8080",
   "store": {"use": "sqlite", "sqlite": {"path": "niromem.db"}},
   "auth": {"dev": true},
-  "worker": {"inline": true, "concurrency": 2},
+  "blob": {"use": "dir", "dir": {"path": "blobs"}},
+  "documents": {"enabled": true, "concurrency": 2},
+  "worker": {"inline": true, "concurrency": 1},
   "embedder": {
     "use": "ollama",
     "ollama": {
@@ -25,7 +27,10 @@
       "ollama": {
         "base_url": "http://127.0.0.1:11434",
         "model": "qwen3:0.6b",
-        "think": false
+        "think": false,
+        "num_thread": 4,
+        "num_ctx": 4096,
+        "num_predict": 768
       }
     },
     "profiles": {
@@ -36,7 +41,7 @@
     },
     "max_candidates": 8,
     "max_graph_hops": 2,
-    "timeout_ms": 15000,
+    "timeout_ms": 600000,
     "fallback": false
   }
 }

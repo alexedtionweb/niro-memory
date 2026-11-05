@@ -1,6 +1,15 @@
 -- niro-agent-memory PostgreSQL schema, version 1. Idempotent; applied under
 -- an advisory lock so many nodes can start at once.
 
+CREATE TABLE IF NOT EXISTS tenant_purges (
+    tenant TEXT PRIMARY KEY, id TEXT NOT NULL, state TEXT NOT NULL,
+    phase INTEGER NOT NULL, deleted BIGINT NOT NULL, ready_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tenant_purge_requests (
+    tenant TEXT NOT NULL, request_id TEXT NOT NULL, purge_id TEXT NOT NULL,
+    PRIMARY KEY (tenant, request_id)
+);
+
 CREATE TABLE IF NOT EXISTS memories (
     tenant         text        NOT NULL,
     id             text        NOT NULL,
@@ -42,6 +51,9 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 CREATE INDEX IF NOT EXISTS memories_owner ON memories (tenant, user_id, agent_id, id);
 CREATE INDEX IF NOT EXISTS memories_hash ON memories (tenant, hash);
+CREATE INDEX IF NOT EXISTS memories_enrichment_identity ON memories
+    (tenant, (CASE WHEN jsonb_typeof(metadata->'enrichment_identity') = 'string'
+        THEN metadata->>'enrichment_identity' END));
 CREATE INDEX IF NOT EXISTS memories_supersedes ON memories (tenant, supersedes) WHERE supersedes <> '';
 CREATE INDEX IF NOT EXISTS memories_tsv ON memories USING gin (tsv);
 CREATE UNIQUE INDEX IF NOT EXISTS memories_slot ON memories (tenant, user_id, agent_id, slot)
@@ -156,6 +168,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     payload     bytea,
     state       text        NOT NULL,
     attempts    int         NOT NULL DEFAULT 0,
+    priority    int         NOT NULL DEFAULT 0 CHECK (priority BETWEEN -100 AND 100),
     not_before  timestamptz NOT NULL,
     lease_until timestamptz,
     worker      text        NOT NULL DEFAULT '',
@@ -167,6 +180,10 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_pending_key ON jobs (tenant, kind, key) WHERE state = 'pending' AND key <> '';
 CREATE INDEX IF NOT EXISTS jobs_due ON jobs (state, not_before);
 CREATE INDEX IF NOT EXISTS jobs_key ON jobs (tenant, kind, key);
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS priority int NOT NULL DEFAULT 0 CHECK (priority BETWEEN -100 AND 100);
+CREATE INDEX IF NOT EXISTS jobs_priority_due ON jobs (state, priority DESC, not_before, tenant);
+CREATE INDEX IF NOT EXISTS jobs_tenant_state_id ON jobs (tenant, state, id);
+CREATE INDEX IF NOT EXISTS jobs_tenant_id ON jobs (tenant, id);
 
 CREATE TABLE IF NOT EXISTS settings (
     tenant text  PRIMARY KEY,

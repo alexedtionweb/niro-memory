@@ -70,7 +70,7 @@ func (s *Server) HTTPHandler(port, token string) http.Handler {
 			http.Error(w, "unsupported MCP-Protocol-Version", http.StatusBadRequest)
 			return
 		}
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		r.Body = http.MaxBytesReader(w, r.Body, int64(s.maxRequestBytes()))
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			var tooLarge *http.MaxBytesError

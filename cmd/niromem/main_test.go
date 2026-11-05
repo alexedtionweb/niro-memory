@@ -46,7 +46,7 @@ func TestConfig(t *testing.T) {
 		`{"auth":{"dev":true},"knowledge":{"mode":"automatic"}}`,
 		`{"auth":{"dev":true},"knowledge":{"max_candidates":1001}}`,
 		`{"auth":{"dev":true},"knowledge":{"max_graph_hops":9}}`,
-		`{"auth":{"dev":true},"knowledge":{"timeout_ms":30001}}`,
+		`{"auth":{"dev":true},"knowledge":{"timeout_ms":1800001}}`,
 		`{"auth":{"dev":true},"knowledge":{"planner":{"use":"unknown"}}}`,
 		`{"auth":{"dev":true},"knowledge":{"admission":{"enabled":true,"max_text_bytes":-1}}}`,
 		`{"auth":{"dev":true},"knowledge":{"admission":{"enabled":true,"max_text_bytes":1048577}}}`,

@@ -247,11 +247,19 @@ type ListRequest struct {
 	Order            store.Order      `json:"order,omitempty"`
 	Limit            int              `json:"limit,omitempty"`
 	Offset           int              `json:"offset,omitempty"`
+	// BeforeID is an exclusive keyset cursor for newest-first listing.
+	BeforeID string `json:"before_id,omitempty"`
 }
 
 // List returns memories in store order (newest first by default).
 func (e *Engine) List(ctx context.Context, r ListRequest) (out []memory.Memory, err error) {
 	defer e.observe("list", time.Now(), err)
+	if r.BeforeID != "" {
+		if r.Offset != 0 || r.Order != store.NewestFirst {
+			return nil, fmt.Errorf("%w: before_id requires newest-first order and no offset", memory.ErrInvalid)
+		}
+		r.Filter = memory.And(r.Filter, memory.Cmp("id", memory.OpLt, r.BeforeID))
+	}
 	q, err := e.query(ctx, r.Tenant, r.As, r.User, r.Agent, r.Run, r.Filter)
 	if err != nil {
 		return nil, err

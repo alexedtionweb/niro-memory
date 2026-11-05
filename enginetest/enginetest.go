@@ -35,6 +35,9 @@ const testRules = `{"version":1,
 // Run executes the scenarios. Each gets a fresh store.
 func Run(t *testing.T, newStore Factory) {
 	t.Run("GroundedBackgroundEnrichment", func(t *testing.T) { testEnrichment(t, newStore) })
+	t.Run("ConcurrentEnrichmentDeduplication", func(t *testing.T) { testEnrichmentDedup(t, newStore) })
+	t.Run("EnrichmentDedupLifecycle", func(t *testing.T) { testEnrichmentDedupLifecycle(t, newStore) })
+	t.Run("TypedEntityOnlyEnrichment", func(t *testing.T) { testEntityOnlyEnrichment(t, newStore) })
 	t.Run("KnowledgeIntelligence", func(t *testing.T) { testKnowledge(t, newStore) })
 	t.Run("DerivedRelationships", func(t *testing.T) { testRelationships(t, newStore) })
 	rs, err := rules.Parse([]byte(testRules))
