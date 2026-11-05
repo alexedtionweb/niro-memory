@@ -1,0 +1,45 @@
+{{define "layout_console"}}<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="htmx-config" content='{"allowEval":false,"allowScriptTags":false,"selfRequestsOnly":true,"historyCacheSize":0,"timeout":15000}'>
+  <title>niromem · {{.Title}}</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/_dev/vendor/pico-2.1.1.min.css">
+  <link rel="stylesheet" href="/_dev/console.css">
+  <script src="/_dev/vendor/htmx-2.0.8.min.js" defer></script>
+  <script type="module" src="/_dev/js/console.js"></script>
+</head>
+<body class="console-page">
+  <header class="console-topbar">
+    <a class="console-brand" href="/_dev/overview">niromem <span>· {{.Tenant}}</span></a>
+    <form class="global-search" action="/_dev/search" method="get" role="search">
+      <label class="sr-only" for="console-query">Search memories</label>
+      <input id="console-query" name="q" type="search" placeholder="Search memories… (/)">
+    </form>
+    <a class="health-link {{.HealthClass}}" href="/_dev/operations" aria-label="System health: {{.HealthLabel}}">
+      <span class="health-dot" aria-hidden="true"></span>{{.HealthLabel}}
+    </a>
+  </header>
+  <div class="console-frame">
+    <nav class="console-sidebar" aria-label="Main navigation">
+      <a href="/_dev/overview" {{if eq .Active "overview"}}aria-current="page" class="active"{{end}}>Overview</a>
+      <a href="/_dev/memories" aria-disabled="true" title="Coming soon">Memories</a>
+      <a href="/_dev/search" aria-disabled="true" title="Coming soon">Search Lab</a>
+      <a href="/_dev/sources" {{if eq .Active "sources"}}aria-current="page" class="active"{{end}}>Sources</a>
+      <a href="/_dev/activity" aria-disabled="true" title="Coming soon">Activity</a>
+      <a href="/_dev/operations" aria-disabled="true" title="Coming soon">Operations</a>
+      <a href="/_dev/settings" aria-disabled="true" title="Coming soon">Settings</a>
+      <hr>
+      <a href="/_dev/">Classic view</a>
+    </nav>
+    <main class="console-main">
+      <nav class="breadcrumbs" aria-label="Breadcrumb">
+        {{range $i, $crumb := .Breadcrumbs}}{{if $i}}<span aria-hidden="true">›</span>{{end}}{{if $crumb.URL}}<a href="{{$crumb.URL}}">{{$crumb.Text}}</a>{{else}}<span aria-current="page">{{$crumb.Text}}</span>{{end}}{{end}}
+      </nav>
+      {{block "content" .}}{{end}}
+    </main>
+  </div>
+</body>
+</html>{{end}}
